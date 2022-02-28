@@ -91,6 +91,7 @@ import tensorflow_datasets as tfds
     with_info=True,
 )
 ds_train = ds_train.batch(nb).prefetch(1)
+ds_test = ds_test.batch(nb)
 img_size = ds_info.features['image'].shape
 
 #%%
@@ -148,7 +149,7 @@ for en in range(epoch_no):
     for x, y in tfds.as_numpy(ds_train):
         opt_state, params = train_step(params, opt_state, jkey, np.array(x).astype(np.float32)/255.0)
         _, jkey = jax.random.split(jkey)
-    for x, y in ds_train.take(1):
+    for x, y in ds_test.take(1):
         display_predictions(params, jkey, x)
 
 # %%
