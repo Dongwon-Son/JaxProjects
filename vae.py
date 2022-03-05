@@ -52,7 +52,8 @@ def vae_reconstruction_func(variable_tuple, jkey, data, enc_model, dec_model):
 
 def vae_loss_func(variable_tuple, jkey, data, enc_model, dec_model):
     xp, (z_mu, z_sigma, z) = vae_reconstruction_func(variable_tuple, jkey, data, enc_model, dec_model)
-    kld = -0.5 * jnp.sum(1 + jnp.log(z_sigma) - jnp.square(z_mu) - z_sigma, axis=-1)
+    z_var = jnp.square(z_sigma)
+    kld = -0.5 * jnp.sum(1 + jnp.log(z_var) - jnp.square(z_mu) - z_var, axis=-1)
     return 2000*jnp.mean(jnp.square(data - xp)) + jnp.mean(kld)
 
 # %%
