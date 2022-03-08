@@ -5,6 +5,7 @@ import jax
 import jaxlie as jl
 from functools import partial
 import time
+import jaxlie
 
 def visualize_sdf(sdf_func):
     NS = 80
@@ -101,14 +102,12 @@ def sdf_renderer(sdf_func, depth_out=False, cam_SE3=None, color=jnp.array([230/2
         return img
 
 
-@partial(jax.jit, static_argnums=(0,1))
-def sdf_renderer_exact(sdf_func, cam_SE3=None, color=jnp.array([230/255, 9/255, 101/255]), background_color=jnp.array([1,1,1])):
+# @partial(jax.jit, static_argnums=(0,1))
+def sdf_renderer_exact(sdf_func, cam_SE3=None, near=0.01, far=2.0, light_position=jnp.array([0.2,0.2,1]), color=jnp.array([230/255, 9/255, 101/255]), background_color=jnp.array([1,1,1])):
     # hyper parameters
-    NS = 40
-    PIXEL_SIZE =  [400, 400]
-    cam_zeta = [250, 250, 0.5*(400-1), 0.5*(400-1)]
-    near = 0.01
-    far = 2.0
+    NS = 20
+    PIXEL_SIZE =  [120, 120]
+    cam_zeta = [PIXEL_SIZE[1]*0.8, PIXEL_SIZE[0]*0.8, 0.5*(PIXEL_SIZE[1]-1), 0.5*(PIXEL_SIZE[0]-1)]
 
     def vec_normalize(vec):
         return vec/(jnp.linalg.norm(vec, axis=-1, keepdims=True) + 1e-8)
@@ -144,7 +143,7 @@ def sdf_renderer_exact(sdf_func, cam_SE3=None, color=jnp.array([230/255, 9/255, 
     # batch ray marching
     ray_sample_pnts = rays_s[...,None,:] + ray_dir[...,None,:] * jnp.arange(NS)[...,None]/NS
     sd_res = sdf_func(ray_sample_pnts)
-    for _ in range(40):
+    for _ in range(50):
         ray_sample_pnts += sd_res[...,None]*ray_dir_normalized[...,None,:]
         sd_res = sdf_func(ray_sample_pnts)
     boundary_mask = jnp.array(jnp.abs(sd_res) < 5e-5, jnp.float32)
@@ -157,48 +156,72 @@ def sdf_renderer_exact(sdf_func, cam_SE3=None, color=jnp.array([230/255, 9/255, 
     # depth to pnts
     obj_mask = 1-depth_dist[...,-1:]
 
-    light_position = jnp.array([1,1,1])
-    vec_to_light = vec_normalize(light_position - boundary_pnts)
+    vec_to_light = light_position - boundary_pnts
+    len_to_light = jnp.linalg.norm(vec_to_light, axis=-1, keepdims=True)
+    vec_to_light = vec_to_light / len_to_light
     grad_func = jax.grad(sdf_func)
     normal_vector = jnp.reshape(jax.vmap(grad_func)(jnp.reshape(boundary_pnts, (-1,3))), boundary_pnts.shape)
     normal_vector = vec_normalize(normal_vector)
 
     to_view_start = vec_normalize(rays_s - boundary_pnts)
     reflection_vec = 2*(jnp.sum(normal_vector*vec_to_light, axis=-1, keepdims=True))*normal_vector - vec_to_light
-    spec_alpha = 10
-    img = obj_mask * (0.8*color + 
-                    jnp.sum(normal_vector*vec_to_light, axis=-1, keepdims=True)*color+
-                    0.8*(jnp.maximum(jnp.sum(reflection_vec*to_view_start,axis=-1,keepdims=True), 0)**spec_alpha)*jnp.array([1,1,1])
+
+    spec_alpha = 5
+    LightPower = 3.0
+    cosTheta = jnp.clip( jnp.sum(normal_vector*vec_to_light , axis=-1, keepdims=True), 0,1 )
+    cosAlpha = jnp.clip( jnp.sum(reflection_vec*to_view_start,axis=-1,keepdims=True), 0,1 )
+    img = obj_mask * (0.2*color + 
+                    color * LightPower * cosTheta / (len_to_light*len_to_light) +
+                    0.3*jnp.ones((3,)) * LightPower * pow(cosAlpha,spec_alpha) / (len_to_light*len_to_light)
                     )\
             + background_color * (1-obj_mask)
     img = jnp.clip(img, 0, 1)
     return img
 
+# sdf_crop_scale = 0.10
+def sphere_sdf(r):
+    return lambda x : -r+jnp.linalg.norm(x, axis=-1)
+    # return lambda x : jax.nn.tanh(-1/sdf_crop_scale*(r-jnp.linalg.norm(x, axis=-1)))*sdf_crop_scale
+
+def box_sdf(h_ext):
+    return lambda x : -jnp.min(h_ext-jnp.abs(x), axis=-1)
+    # return lambda x : jax.nn.tanh(-1/sdf_crop_scale*jnp.min(h_ext-jnp.abs(x), axis=-1))*sdf_crop_scale
+
+def transform_sdf(sdf_func, SE3: jaxlie.SE3):
+    SE3_inv = SE3.inverse()
+    return lambda x : sdf_func(batch_operator(SE3_inv.apply, x))
+
+def union_sdf(sdf_func1, sdf_func2):
+    return lambda x : jnp.minimum(sdf_func1(x), sdf_func2(x))
+
+def intersection_sdf(sdf_func1, sdf_func2):
+    return lambda x : jnp.maximum(sdf_func1(x), sdf_func2(x))
+
+def batch_operator(operator, batch_data):
+    origin_shape = batch_data.shape
+    return jnp.reshape(jax.vmap(operator)(jnp.reshape(batch_data, (-1, origin_shape[-1]))), origin_shape[:-1]+(-1,))
+
+def normalize(vec):
+    return vec/(jnp.linalg.norm(vec, axis=-1, keepdims=True) + 1e-8)
+
 # %%
 if __name__ == '__main__':
     import matplotlib.pyplot as plt
-    sdf_crop_scale = 0.10
-    def sphere_sdf(center, r, x):
-        # return jax.nn.sigmoid(30*(r-jnp.linalg.norm(x - center, axis=-1)))
-        return jax.nn.tanh(-1/sdf_crop_scale*(r-jnp.linalg.norm(x - center, axis=-1)))*sdf_crop_scale
-    
-    def box_sdf(center, h_ext, x):
-        # return jax.nn.sigmoid(30*jnp.min(h_ext-jnp.abs(x-center), axis=-1))
-        return jax.nn.tanh(-1/sdf_crop_scale*jnp.min(h_ext-jnp.abs(x-center), axis=-1))*sdf_crop_scale
 
-    # sdf_func = (lambda x : sphere_sdf(np.array([0,0,0]), 0.4, x))
-    sdf_func = (lambda x : box_sdf(np.array([0,0,0]), np.array([0.2,0.1,0.1]), x))
-    # sdf_func = (lambda x : jnp.maximum(-sphere_sdf(np.array([0,0,0]), 0.4, x),
-    #             box_sdf(np.array([0,0,0]), np.array([0.2,0.2,0.6]), x)))
-    # sdf_func = (lambda x : jnp.minimum(sphere_sdf(np.array([0,0,0]), 0.4, x),
-    #             sphere_sdf(np.array([0,0,0.4]), 0.1, x)))
-    # img = sdf_renderer(sdf_func)
-    img = sdf_renderer_exact(sdf_func)
+    sdf_func = sphere_sdf(1.0)
+    # sdf_func = union_sdf(sphere_sdf(0.4), box_sdf(np.array([0.6,0.1,0.1])))
 
-    time_s = time.time()
-    for _ in range(100):
-        sdf_renderer_exact(sdf_func)
-    print(time.time() - time_s)
+    view_SO3 = jl.SO3.from_x_radians(jnp.pi+jnp.pi/8)@jl.SO3.from_y_radians(jnp.pi/8)
+    cam_SE3 = jl.SE3.from_rotation(rotation=view_SO3) @ \
+        jl.SE3.from_rotation_and_translation(rotation=jl.SO3(jnp.array([1,0,0,0],dtype=jnp.float32)), translation=jnp.array([0,0,-2.0]))
+    light_position = jnp.array([-1.5,1.0,2.0])
+
+    img = sdf_renderer_exact(sdf_func, cam_SE3=cam_SE3, far=3, light_position=light_position)
+
+    # time_s = time.time()
+    # for _ in range(100):
+    #     sdf_renderer_exact(sdf_func)
+    # print(time.time() - time_s)
 
     plt.figure()
     plt.imshow(img)
