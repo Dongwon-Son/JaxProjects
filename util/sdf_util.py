@@ -3,6 +3,8 @@ import jax.numpy as jnp
 import numpy as np
 import jax
 import jaxlie as jl
+from functools import partial
+import time
 
 def visualize_sdf(sdf_func):
     NS = 80
@@ -30,8 +32,9 @@ def visualize_sdf(sdf_func):
     depth = jnp.reshape(depth, img_size)
     return depth
 
+@partial(jax.jit, static_argnums=(0,1,2))
 def sdf_renderer(sdf_func, depth_out=False, cam_SE3=None, color=jnp.array([230/255, 9/255, 101/255]), background_color=jnp.array([1,1,1])):
-    NS = 80
+    NS = 2000
     PIXEL_SIZE =  [80, 80]
     def vec_normalize(vec):
         return vec/(jnp.linalg.norm(vec, axis=-1, keepdims=True) + 1e-8)
@@ -39,14 +42,15 @@ def sdf_renderer(sdf_func, depth_out=False, cam_SE3=None, color=jnp.array([230/2
     if cam_SE3 is None:
         view_SO3 = jl.SO3.from_x_radians(jnp.pi/6)@jl.SO3.from_y_radians(jnp.pi/6)
         cam_SE3 = jl.SE3.from_rotation(rotation=view_SO3) @ \
-                jl.SE3.from_rotation_and_translation(rotation=jl.SO3(jnp.array([1,0,0,0],dtype=jnp.float32)), translation=jnp.array([0,0,1]))
+                jl.SE3.from_rotation_and_translation(rotation=jl.SO3(jnp.array([1,0,0,0],dtype=jnp.float32)), translation=jnp.array([0,0,0.8]))
 
     # pixel sampling
+    ray_distance = 2.0
     x_grid, y_grid = jnp.meshgrid(jnp.arange(PIXEL_SIZE[1]), jnp.arange(PIXEL_SIZE[0]))
     x_grid_centered = (x_grid - 0.5*(PIXEL_SIZE[1]-1))/(PIXEL_SIZE[1]-1)
     y_mesh_centered = -(y_grid - 0.5*(PIXEL_SIZE[0]-1))/(PIXEL_SIZE[0]-1)
     rays_s_canonical = jnp.stack([x_grid_centered, y_mesh_centered, jnp.zeros_like(y_mesh_centered)], axis=-1)
-    rays_e_canonical = jnp.stack([x_grid_centered, y_mesh_centered, -jnp.ones_like(y_mesh_centered)], axis=-1)
+    rays_e_canonical = jnp.stack([x_grid_centered, y_mesh_centered, -ray_distance*jnp.ones_like(y_mesh_centered)], axis=-1)
     origin_shape = rays_s_canonical.shape
 
     # cam SE3 transformation
@@ -62,7 +66,7 @@ def sdf_renderer(sdf_func, depth_out=False, cam_SE3=None, color=jnp.array([230/2
     rev_sd_scan = jax.lax.associative_scan(lambda a,x: a*x, rev_sd_res, axis=-1)
     rev_sd_scan = jnp.concatenate([jnp.ones_like(rev_sd_scan[...,-1:]), rev_sd_scan], axis=-1)
     depth_arr = jnp.linalg.norm(rays_e - rays_s, axis=-1, keepdims=True) * jnp.arange(NS+1)/NS
-    depth_dist = rev_sd_scan * jnp.concatenate([sd_res, jnp.ones_like(sd_res[...,-1:])], axis=-1)
+    depth_dist = rev_sd_scan * jnp.concatenate([sd_res, 5*jnp.ones_like(sd_res[...,-1:])], axis=-1)
     depth_dist = depth_dist / (jnp.sum(depth_dist, axis=-1, keepdims=True)+ 1e-8)
     depth = jnp.sum(depth_dist*depth_arr, axis=-1)
     depth = jnp.reshape(depth, PIXEL_SIZE)
@@ -72,10 +76,9 @@ def sdf_renderer(sdf_func, depth_out=False, cam_SE3=None, color=jnp.array([230/2
     depth_align = 1
     depth_pnts = depth_start_pnts + ray_dir_normalized * depth[...,None] * depth_align
 
-    depth_pnts_sd_res = sdf_func(depth_pnts)
-    # ambient_color = jnp.array([0.3,0.1,0.1])
-    # background_color = jnp.array([1,1,1])
-    obj_mask = jnp.array(depth_pnts_sd_res[...,None] > 0.1, dtype=jnp.float32)
+    # depth_pnts_sd_res = sdf_func(depth_pnts)
+    # obj_mask = jnp.array(depth_pnts_sd_res[...,None] > 0.1, dtype=jnp.float32)
+    obj_mask = 1-depth_dist[...,-1:]
 
     light_position = jnp.array([1,1,1])
     vec_to_light = vec_normalize(light_position - depth_pnts)
@@ -98,25 +101,106 @@ def sdf_renderer(sdf_func, depth_out=False, cam_SE3=None, color=jnp.array([230/2
         return img
 
 
+@partial(jax.jit, static_argnums=(0,1))
+def sdf_renderer_exact(sdf_func, cam_SE3=None, color=jnp.array([230/255, 9/255, 101/255]), background_color=jnp.array([1,1,1])):
+    # hyper parameters
+    NS = 40
+    PIXEL_SIZE =  [400, 400]
+    cam_zeta = [250, 250, 0.5*(400-1), 0.5*(400-1)]
+    near = 0.01
+    far = 2.0
+
+    def vec_normalize(vec):
+        return vec/(jnp.linalg.norm(vec, axis=-1, keepdims=True) + 1e-8)
+
+    if cam_SE3 is None:
+        view_SO3 = jl.SO3.from_x_radians(jnp.pi+jnp.pi/6)@jl.SO3.from_y_radians(jnp.pi/6)
+        cam_SE3 = jl.SE3.from_rotation(rotation=view_SO3) @ \
+                jl.SE3.from_rotation_and_translation(rotation=jl.SO3(jnp.array([1,0,0,0],dtype=jnp.float32)), translation=jnp.array([0,0,-0.8]))
+
+    K_mat = jnp.array([[cam_zeta[0], 0, cam_zeta[2]],
+                    [0, cam_zeta[1], cam_zeta[3]],
+                    [0,0,1]])
+
+    # pixel= PVM (colomn-wise)
+    # M : points
+    # V : inv(cam_SE3)
+    # P : Z projection and intrinsic matrix  
+    x_grid_idx, y_grid_idx = jnp.meshgrid(jnp.arange(PIXEL_SIZE[1]), jnp.arange(PIXEL_SIZE[0]))
+    pixel_pnts = jnp.concatenate([x_grid_idx[...,None], y_grid_idx[...,None], jnp.ones_like(y_grid_idx[...,None])], axis=-1)
+    pixel_pnts = jnp.array(pixel_pnts, dtype=jnp.float32)
+    K_mat_inv = jnp.linalg.inv(K_mat)
+    pixel_pnts = jnp.matmul(K_mat_inv,pixel_pnts[...,None])[...,0]
+    rays_s_canonical = pixel_pnts * near
+    rays_e_canonical = pixel_pnts * far
+    origin_shape = rays_s_canonical.shape
+
+    # cam SE3 transformation
+    rays_s = jnp.reshape(jax.vmap(cam_SE3.apply)(jnp.reshape(rays_s_canonical, (-1,3))), origin_shape)
+    rays_e = jnp.reshape(jax.vmap(cam_SE3.apply)(jnp.reshape(rays_e_canonical, (-1,3))), origin_shape)
+    ray_dir = rays_e - rays_s
+    ray_dir_normalized = ray_dir/jnp.linalg.norm(ray_dir, axis=-1, keepdims=True)
+
+    # batch ray marching
+    ray_sample_pnts = rays_s[...,None,:] + ray_dir[...,None,:] * jnp.arange(NS)[...,None]/NS
+    sd_res = sdf_func(ray_sample_pnts)
+    for _ in range(40):
+        ray_sample_pnts += sd_res[...,None]*ray_dir_normalized[...,None,:]
+        sd_res = sdf_func(ray_sample_pnts)
+    boundary_mask = jnp.array(jnp.abs(sd_res) < 5e-5, jnp.float32)
+    rev_bm = 1-boundary_mask
+    rev_bm = jax.lax.associative_scan(lambda a,x: a*x, rev_bm, axis=-1)
+    rev_bm = jnp.concatenate([jnp.ones_like(rev_bm[...,-1:]), rev_bm], axis=-1)
+    depth_dist = rev_bm * jnp.concatenate([boundary_mask, jnp.ones_like(sd_res[...,-1:])], axis=-1)
+    boundary_pnts = jnp.sum(jnp.concatenate([ray_sample_pnts,rays_e[...,None,:]], axis=-2)*depth_dist[...,None], axis=-2)
+
+    # depth to pnts
+    obj_mask = 1-depth_dist[...,-1:]
+
+    light_position = jnp.array([1,1,1])
+    vec_to_light = vec_normalize(light_position - boundary_pnts)
+    grad_func = jax.grad(sdf_func)
+    normal_vector = jnp.reshape(jax.vmap(grad_func)(jnp.reshape(boundary_pnts, (-1,3))), boundary_pnts.shape)
+    normal_vector = vec_normalize(normal_vector)
+
+    to_view_start = vec_normalize(rays_s - boundary_pnts)
+    reflection_vec = 2*(jnp.sum(normal_vector*vec_to_light, axis=-1, keepdims=True))*normal_vector - vec_to_light
+    spec_alpha = 10
+    img = obj_mask * (0.8*color + 
+                    jnp.sum(normal_vector*vec_to_light, axis=-1, keepdims=True)*color+
+                    0.8*(jnp.maximum(jnp.sum(reflection_vec*to_view_start,axis=-1,keepdims=True), 0)**spec_alpha)*jnp.array([1,1,1])
+                    )\
+            + background_color * (1-obj_mask)
+    img = jnp.clip(img, 0, 1)
+    return img
+
 # %%
 if __name__ == '__main__':
     import matplotlib.pyplot as plt
+    sdf_crop_scale = 0.10
     def sphere_sdf(center, r, x):
-        return jax.nn.sigmoid(100*(r-jnp.linalg.norm(x - center, axis=-1)))
-        # return jnp.array((jnp.sum((x - center)**2, axis=-1) < r**2), dtype=jnp.float32)
+        # return jax.nn.sigmoid(30*(r-jnp.linalg.norm(x - center, axis=-1)))
+        return jax.nn.tanh(-1/sdf_crop_scale*(r-jnp.linalg.norm(x - center, axis=-1)))*sdf_crop_scale
     
-    # depth = visualize_sdf(lambda x : sphere_sdf(np.array([0,0,0]), 0.1, x))
+    def box_sdf(center, h_ext, x):
+        # return jax.nn.sigmoid(30*jnp.min(h_ext-jnp.abs(x-center), axis=-1))
+        return jax.nn.tanh(-1/sdf_crop_scale*jnp.min(h_ext-jnp.abs(x-center), axis=-1))*sdf_crop_scale
 
-    # view_SO3 = jl.SO3.from_x_radians(jnp.pi/6)@jl.SO3.from_y_radians(jnp.pi/6)
-    # cam_SE3 = jl.SE3.from_rotation(rotation=view_SO3) @ \
-    #         jl.SE3.from_rotation_and_translation(rotation=jl.SO3(jnp.array([1,0,0,0],dtype=jnp.float32)), translation=jnp.array([0,0,1]))
-    img, depth = sdf_renderer(lambda x : sphere_sdf(np.array([0,0,0]), 0.4, x))
+    # sdf_func = (lambda x : sphere_sdf(np.array([0,0,0]), 0.4, x))
+    sdf_func = (lambda x : box_sdf(np.array([0,0,0]), np.array([0.2,0.1,0.1]), x))
+    # sdf_func = (lambda x : jnp.maximum(-sphere_sdf(np.array([0,0,0]), 0.4, x),
+    #             box_sdf(np.array([0,0,0]), np.array([0.2,0.2,0.6]), x)))
+    # sdf_func = (lambda x : jnp.minimum(sphere_sdf(np.array([0,0,0]), 0.4, x),
+    #             sphere_sdf(np.array([0,0,0.4]), 0.1, x)))
+    # img = sdf_renderer(sdf_func)
+    img = sdf_renderer_exact(sdf_func)
+
+    time_s = time.time()
+    for _ in range(100):
+        sdf_renderer_exact(sdf_func)
+    print(time.time() - time_s)
 
     plt.figure()
-    plt.subplot(1,2,1)
-    plt.imshow(depth)
-    plt.axis('off')
-    plt.subplot(1,2,2)
     plt.imshow(img)
     plt.axis('off')
     plt.show()
