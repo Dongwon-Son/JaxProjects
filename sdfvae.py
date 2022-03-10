@@ -17,7 +17,7 @@ import jaxlie as jl
 import util.sdf_util as sdfu
 
 # %% hyper parameters
-mesh_list = glob.glob('obj_mesh/*/meshes/*.obj')[:20]
+mesh_list = glob.glob('obj_mesh/*/meshes/*.obj')[:100]
 pic_dict = {}
 sdf_label_dict = {}
 scene_dict = {}
@@ -46,7 +46,7 @@ def gen_one_data():
         aabb = mesh_legacy.get_axis_aligned_bounding_box()
         origin_aabb = aabb
         mesh_legacy.translate(-aabb.get_center())
-        mesh_legacy.scale(1/np.max(aabb.get_half_extent()), center=np.zeros(3))
+        mesh_legacy.scale(1/np.max(aabb.get_half_extent())*0.85, center=np.zeros(3))
         # draw(mesh_legacy)
 
         mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh_legacy)

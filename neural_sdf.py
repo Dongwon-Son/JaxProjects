@@ -27,7 +27,7 @@ mesh_legacy = o3d.io.read_triangle_mesh(pick_mesh_dir)
 mesh_legacy.compute_vertex_normals()
 aabb = mesh_legacy.get_axis_aligned_bounding_box()
 mesh_legacy.translate(-aabb.get_center())
-mesh_legacy.scale(1/np.max(aabb.get_half_extent()), center=np.zeros(3))
+mesh_legacy.scale(1/np.max(aabb.get_half_extent())*0.85, center=np.zeros(3))
 aabb = mesh_legacy.get_axis_aligned_bounding_box()
 mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh_legacy)
 scene = o3d.t.geometry.RaycastingScene()
@@ -128,7 +128,7 @@ data = batch_data_gen()
 
 # %%
 # init networks
-dec = DecSDF(0.15)
+dec = DecSDF(1.0)
 
 jkey =jax.random.PRNGKey(0)
 dec_param = dec.init(jkey, data[0])

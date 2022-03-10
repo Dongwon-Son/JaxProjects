@@ -108,6 +108,8 @@ def sdf_renderer_exact(sdf_func, cam_SE3=None, near=0.01, far=2.0, light_positio
     NS = 20
     PIXEL_SIZE =  [120, 120]
     cam_zeta = [PIXEL_SIZE[1]*0.8, PIXEL_SIZE[0]*0.8, 0.5*(PIXEL_SIZE[1]-1), 0.5*(PIXEL_SIZE[0]-1)]
+    spec_alpha = 5
+    LightPower = 5.0
 
     def vec_normalize(vec):
         return vec/(jnp.linalg.norm(vec, axis=-1, keepdims=True) + 1e-8)
@@ -143,7 +145,7 @@ def sdf_renderer_exact(sdf_func, cam_SE3=None, near=0.01, far=2.0, light_positio
     # batch ray marching
     ray_sample_pnts = rays_s[...,None,:] + ray_dir[...,None,:] * jnp.arange(NS)[...,None]/NS
     sd_res = sdf_func(ray_sample_pnts)
-    for _ in range(50):
+    for _ in range(20):
         ray_sample_pnts += sd_res[...,None]*ray_dir_normalized[...,None,:]
         sd_res = sdf_func(ray_sample_pnts)
     boundary_mask = jnp.array(jnp.abs(sd_res) < 5e-5, jnp.float32)
@@ -166,8 +168,6 @@ def sdf_renderer_exact(sdf_func, cam_SE3=None, near=0.01, far=2.0, light_positio
     to_view_start = vec_normalize(rays_s - boundary_pnts)
     reflection_vec = 2*(jnp.sum(normal_vector*vec_to_light, axis=-1, keepdims=True))*normal_vector - vec_to_light
 
-    spec_alpha = 5
-    LightPower = 3.0
     cosTheta = jnp.clip( jnp.sum(normal_vector*vec_to_light , axis=-1, keepdims=True), 0,1 )
     cosAlpha = jnp.clip( jnp.sum(reflection_vec*to_view_start,axis=-1,keepdims=True), 0,1 )
     img = obj_mask * (0.2*color + 
@@ -208,8 +208,8 @@ def normalize(vec):
 if __name__ == '__main__':
     import matplotlib.pyplot as plt
 
-    sdf_func = sphere_sdf(1.0)
-    # sdf_func = union_sdf(sphere_sdf(0.4), box_sdf(np.array([0.6,0.1,0.1])))
+    # sdf_func = sphere_sdf(0.8)
+    sdf_func = union_sdf(sphere_sdf(0.6), box_sdf(np.array([0.8,0.1,0.1])))
 
     view_SO3 = jl.SO3.from_x_radians(jnp.pi+jnp.pi/8)@jl.SO3.from_y_radians(jnp.pi/8)
     cam_SE3 = jl.SE3.from_rotation(rotation=view_SO3) @ \
