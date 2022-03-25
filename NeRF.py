@@ -22,11 +22,11 @@ fov = 60
 near = 0.1
 if TYPE=='object':
     obj_no = 1
-    far = 0.6
+    far = 0.5
     camera_distance = 0.25
 else:
     obj_no = 9
-    far = 1.2
+    far = 1.0
     camera_distance = 0.4
 intrinsic = [PIXEL_SIZE[1], PIXEL_SIZE[0], 
             PIXEL_SIZE[1]*0.5/np.tan(fov*np.pi/180/2), PIXEL_SIZE[0]*0.5/np.tan(fov*np.pi/180/2), 
@@ -95,7 +95,7 @@ class NeRF(nn.Module):
     @nn.compact
     def __call__(self, x, ray_vec):
         out_bound_mask = jnp.array(jnp.concatenate([x >= 1.0, x <= -1.0], axis=-1), dtype=jnp.float32)
-        out_bound_mask = jnp.max(out_bound_mask, axis=-1)
+        out_bound_mask = jnp.max(out_bound_mask, axis=-1, keepdims=True)
         x = self.positional_embedding(x, 10)
         x = nn.Dense(128)(x)
         x = nn.relu(x)
@@ -240,14 +240,22 @@ def update_step(param, opt_state, cam_pos, img):
     param = optax.apply_updates(param, updates)
     return param, opt_state
 
-update_step_jit = jax.jit(update_step)
+def update_steup_itr(param, opt_state, cam_pos_b, img_b):
+    for _ in range(4):
+        for j in range(int(cam_pos_b.shape[0]/NB)):
+            cur_data = [dt[NB*j:NB*(j+1)] for dt in [cam_pos_b, img_b]]
+            param, opt_state = update_step(param, opt_state, *cur_data)
+    return param, opt_state
+
+# update_step_jit = jax.jit(update_step)
+update_steup_itr_jit = jax.jit(update_steup_itr)
 
 # %%
 # train steps
 def data_generation(jkey):
     cam_pos_b = []
     img_b = []
-    for _ in range(NB):
+    for _ in range(NB*10):
         jkey, _ = jax.random.split(jkey)
         cam_pos = jax.random.normal(jkey, shape=[3])
         xy_normalize = cam_pos[...,:2]/jnp.linalg.norm(cam_pos[...,:2], axis=-1, keepdims=True)
@@ -273,17 +281,21 @@ cam_pos_b, img_b = data_generation(jkey)
 
 # %%
 # star train
+import time
 for i in range(20000):
+    # total_s_t = time.time()
     jkey, _ = jax.random.split(jkey)
     # data generation
     cam_pos_b, img_b = data_generation(jkey)
 
+    dg_end_t = time.time()
     # train
-    param, opt_state = update_step(param, opt_state, cam_pos_b, img_b)
-    # param, opt_state = update_step_jit(param, opt_state, cam_pos_b, img_b)
+    # s_t2 = time.time()
+    param, opt_state = update_steup_itr_jit(param, opt_state, cam_pos_b, img_b)
+    # print(dg_end_t - total_s_t, time.time()-s_t2,time.time()- total_s_t)
     # print(i)
 
-    if i % 50 == 0:
+    if i % 10 == 0:
         # evaluation
         img_pred = nerf_render(lambda x, y : model.apply(param, x, y), cam_pos_b[0])
         plt.figure()
