@@ -1,6 +1,5 @@
 # %%
 # import libraries
-from tkinter import NONE
 import jax.numpy as jnp
 import pybullet as p
 import matplotlib.pyplot as plt

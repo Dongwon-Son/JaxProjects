@@ -14,12 +14,13 @@ import tensorflow_datasets as tfds
 GRID_SIZE = [4,4]
 
 class ViT(nn.Module):
+    base_dim : int = 64
 
     def setup(self):
-        self.k_nn = nn.Dense(32)
-        self.q_nn = nn.Dense(32)
-        self.v_nn = nn.Dense(32)
-        self.in_mlp = nn.Dense(32)
+        self.k_nn = nn.Dense(self.base_dim)
+        self.q_nn = nn.Dense(self.base_dim)
+        self.v_nn = nn.Dense(self.base_dim)
+        self.in_mlp = nn.Dense(self.base_dim)
         self.final_mlp = nn.Dense(10)
         self.layernorm1 = nn.LayerNorm()
         self.layernorm2 = nn.LayerNorm()
@@ -34,13 +35,11 @@ class ViT(nn.Module):
     def attention(self, x):
         nx = self.layernorm1(x)
         k = self.k_nn(nx)
-        # k = nn.relu(k) # (v, n)
         q = self.q_nn(nx)
-        # q = nn.relu(q)
         v = self.v_nn(nx)
         # v = nn.relu(v) # (v, n)
         alpha = jnp.sum(k[...,None,:] * q[...,None,:,:], axis=-1, keepdims=True) # (v, v, 1)
-        alpha = nn.softmax(alpha/jnp.sqrt(32), axis=-3)
+        alpha = nn.softmax(alpha/jnp.sqrt(self.base_dim), axis=-3)
         x = jnp.sum(v[...,None,:] * alpha, axis=-3) + x
         x = self.in_mlp(self.layernorm2(x)) + x
         return x
@@ -54,26 +53,27 @@ class ViT(nn.Module):
         
         # positional encoding
         pe = []
-        seq = jnp.arange(GRID_SIZE[0] * GRID_SIZE[1])
+        seq = jnp.arange(GRID_SIZE[0] * GRID_SIZE[1]) # (NB, NV(16), 1)
         for i in range(4):
             pe.append(jnp.cos(seq*1/10000**(i/4))[None,...,None])
             pe.append(jnp.sin(seq*1/10000**(i/4))[None,...,None])
         pe = jnp.concatenate(pe, axis=-1)
-        pe = jnp.tile(pe, (x.shape[0], 1, 1))
+        pe = jnp.tile(pe, (x.shape[0], 1, 1)) # (NB, NV(16), 2*4)
         x = jnp.concatenate([x, pe], axis=-1)
         
-        x = nn.Dense(32)(x)
+        x = nn.Dense(self.base_dim)(x)
         x = nn.relu(x)
 
         return x
 
 # simple CNN model
 class MLP(nn.Module):
+    base_dim : int = 64
     @nn.compact
     def __call__(self, x):
         x = jnp.reshape(x, (x.shape[0], -1))
         for _ in range(3):
-            x = nn.Dense(64)(x)
+            x = nn.Dense(self.base_dim)(x)
             x = nn.relu(x)
         x = nn.Dense(10)(x)
         return x
@@ -128,8 +128,21 @@ vit_model = ViT()
 # vit_model = MLP()
 # vit_model = CNN()
 jkey = jax.random.PRNGKey(0)
-vit_param = vit_model.init(jkey, jnp.array(test_data[0]))
+test_input = jnp.array(test_data[0], dtype=jnp.float32)/255.0
+vit_param = vit_model.init(jkey, test_input)
 vit_pred_jit = jax.jit(vit_model.apply)
+
+# %%
+# model test
+# parameter count
+flatten_param = jax.tree_util.tree_flatten(vit_param)
+total_shape = jnp.array([jnp.prod(jnp.array(fp.shape)) for fp in flatten_param[0]])
+total_param_cnt = jnp.sum(total_shape)
+print("parameter cnt : {}".format(total_param_cnt))
+
+vit_pred_jit(vit_param, test_input)
+%timeit vit_pred_jit(vit_param, test_input)
+
 # %%
 # train func
 optimizer = optax.adam(5e-4)
