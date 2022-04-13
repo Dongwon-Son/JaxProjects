@@ -17,13 +17,9 @@ import fcl
 from scipy.spatial.transform.rotation import Rotation as sciR
 import random
 import pickle
+import jaxlie
 
-timestep = 0.001
-obj_no = 2
-NS = 16
-NR = 16
-NB = NS*NR
-penetration_clip= 0.050
+PEN_CLIP= 0.010
 
 # %%
 # query fcl
@@ -68,11 +64,26 @@ def batch_query(type, gparam, pos, quat):
     return ans, dir
 
 # %%
-def x_sample(outer_shape):
+def x_sample(outer_shape, pos_scale=0.13):
     type = (np.random.randint(0, 3, size=outer_shape+[1]) == np.arange(3)).astype(np.float32)
+    # type = (np.random.randint(0, 1, size=outer_shape+[1]) == np.arange(3)).astype(np.float32) # test
     gparam = np.random.uniform(0.03,0.06, size=outer_shape+[3])
-    pos = 0.14*tutil.qrand(size=outer_shape+[4])[...,:3]
+    pos = pos_scale*tutil.qrand(size=outer_shape+[4])[...,:3]
     quat = tutil.qrand(size=outer_shape+[4])
+
+    # # # test data
+    # ns = outer_shape[0]
+    # type = np.array([[[1,0,0],[1,0,0]]])
+    # gparam = np.array([[[0.05,0.032,0.055],[0.05,0.035,0.058]]])
+    # ang = np.random.uniform(-np.pi, np.pi, size=[ns*2,1])
+    # quat = sciR.from_euler('x', ang).as_quat().reshape(ns,2,4)
+    # #quat[:,0,:] = [0,0,0,1]
+    # type, gparam = [einops.repeat(e, 'i j k -> (i tile) j k', tile=ns) 
+    #             for e in (type, gparam)]
+    # pos = np.random.uniform(-0.15,0.15,size=[ns,2])
+    # pos = np.concatenate([np.zeros_like(pos[...,:1]), pos], axis=-1)
+    # pos = np.stack([np.zeros_like(pos), pos], axis=-2)
+
     return type, gparam, pos, quat
 
 def x_sample_noise(x, ns):
@@ -84,8 +95,6 @@ def x_sample_noise(x, ns):
     return type, gparam, pos, quat
 
 def make_dataset(ns):
-    total_x = None
-    total_y = None
     while True:
         x = x_sample([ns,2])
         y, dir = batch_query(*x)
@@ -113,20 +122,20 @@ def make_dataset(ns):
                 pos[...,0,:] += -len_distribution * dir[...,None,:]
                 return (type, gparam, pos, quat), len_distribution
 
-        px_gen, py_gen = generate_proximity_data(px, py, pdir, n=3)
+        px_gen, py_gen = generate_proximity_data(px, py, pdir, n=2)
         # py_gt, pdir_gt = batch_query(*[e.reshape(-1,2,e.shape[-1]) for e in px_gen])
         # py_gt = py_gt.reshape(-1,5,1)
         # pdir_gt = pdir_gt.reshape(-1,5,3)
         px_gen = [e.reshape(-1,2,e.shape[-1]) for e in px_gen]
 
-        nx_gen, ny_gen = generate_proximity_data(nx, ny, ndir, n=int(3*p_cnt/n_cnt), uniform_len=True)
+        nx_gen, ny_gen = generate_proximity_data(nx, ny, ndir, n=int(2*p_cnt/n_cnt), uniform_len=True)
         # ny_gt, ndir_gt = batch_query(*[e.reshape(-1,2,e.shape[-1]) for e in nx_gen])
         # ny_gt = ny_gt.reshape(-1,5,1)
         # ndir_gt = ndir_gt.reshape(-1,5,3)
         nx_gen = [e.reshape(-1,2,e.shape[-1]) for e in nx_gen]
 
-        x = [np.concatenate(e, axis=0).reshape(-1,2,e[0].shape[-1]) for e in zip(px_gen, nx_gen)]
-        y = np.concatenate([py_gen.reshape(-1,1), ny_gen.reshape(-1,1)], axis=0).reshape(-1,1)
+        x = [np.concatenate(e, axis=0).reshape(-1,2,e[0].shape[-1]) for e in zip(px_gen, nx_gen, x)]
+        y = np.concatenate([py_gen.reshape(-1,1), ny_gen.reshape(-1,1), y], axis=0).reshape(-1,1)
 
         return x, y
         
@@ -135,7 +144,6 @@ test_data = make_dataset(ns=100)
 
 # %%
 p.connect(p.DIRECT)
-p.setTimeStep(timestep)
 
 # %%
 # get rgb function
@@ -160,9 +168,9 @@ def random_pos_quat(close=True):
         return (np.random.uniform([-0.2,-0.2,-0.2],[0.2,0.2,0.2]),
             tutil.qrand(size=[4]))
 
-def make_objs():
+def make_objs(obj_no, pos_scale=0.4):
     
-    x = x_sample([6])
+    x = x_sample([obj_no], pos_scale=pos_scale)
     p.resetSimulation()
     obj_id_list = []
     obj_type_list = []
@@ -200,20 +208,12 @@ def make_objs():
     return x
     
 
-
-# %%
-
-plt.figure()
-plt.imshow(get_rgb())
-plt.axis('off')
-plt.show()
-
 # %%
 # define CNF
 
 class CNF(nn.Module):
-    feature_dim: int = 128
-    penetration_clip: float=0.003
+    penetration_clip: float
+    feature_dim: int = 256
 
     def positional_embedding(self, x, embedding_size=10):
         pe = []
@@ -224,36 +224,55 @@ class CNF(nn.Module):
         return x
 
     @nn.compact
-    def col_query(self, type1, gparam1, type2, gparam2, pos2, log_quat2):
-        
-        pos = self.positional_embedding(pos2)
-        lq = self.positional_embedding(log_quat2, 10)
+    def col_query(self, type1, gparam1, type2, gparam2, pos2, quat2):
+        gparam1 = nn.BatchNorm(True)(gparam1)
+        gparam2 = nn.BatchNorm(True)(gparam2)
+        rel_pos_limit = 0.20
+        quat_mask = (quat2[...,-1:] > 0).astype(jnp.float32)
+        quat = quat2 * quat_mask + (-quat2) * (1-quat_mask)
+        far_mask = jnp.any(jnp.abs(pos2) > rel_pos_limit, axis=-1).astype(jnp.float32)
+        pos = self.positional_embedding(pos2/rel_pos_limit)
+        quat = self.positional_embedding(quat, 6)
+        gparam1 = self.positional_embedding(gparam1, 6)
+        gparam2 = self.positional_embedding(gparam2, 6)
 
-        x = jnp.concatenate([type1, type2, pos, lq], axis=-1)
+        x = jnp.concatenate([type1, gparam1, type2, gparam2, pos, quat], axis=-1)
 
-        for _ in range(3):
+        for i in range(2):
             x = nn.Dense(self.feature_dim)(x)
             x = nn.relu(x)
+            if i == 0:
+                skip = x
+        x += skip
+
+        for i in range(2):
+            x = nn.Dense(self.feature_dim)(x)
+            x = nn.relu(x)
+            if i == 0:
+                skip = x
+        x += skip
         
         x = nn.Dense(1)(x)
         x = self.penetration_clip*nn.tanh(x)
         x = jnp.squeeze(x, axis=-1)
-        return x
+        return x * (1-far_mask) + self.penetration_clip*far_mask
 
+    # def penetration_and_constraint(self, param, inputs):
+        
     
     def __call__(self, type, gparam, pos, quat):
         
         NN = pos.shape[-2]
-        pos_dif =  pos[...,None,:,:] - pos[...,None,:]
-        # lq_dif = qutil.log(qutil.multi(qutil.inv(quat[...,None,:]), quat[...,None,:,:]))
-        lq_dif = tutil.qmulti(tutil.qinv(quat[...,None,:]), quat[...,None,:,:])
+        typei, gparami, posi, quati = jax.tree_map(
+                            lambda x : einops.repeat(x, 'i j k -> i j tile k', tile=NN),
+                                         (type, gparam, pos, quat))
+        typej, gparamj, posj, quatj = jax.tree_map(
+                            lambda x : einops.repeat(x, 'i j k -> i tile j k', tile=NN),
+                                         (type, gparam, pos, quat))
 
-        typei = einops.repeat(type, 'i j k -> i j tile k', tile=NN)
-        typej = einops.repeat(type, 'i j k -> i tile j k', tile=NN)
-        gparami = einops.repeat(gparam, 'i j k -> i j tile k', tile=NN)
-        gparamj = einops.repeat(gparam, 'i j k -> i tile j k', tile=NN)
+        pos_dif, quat_dif = tutil.pq_multi(*tutil.pq_inv(posi, quati), posj, quatj)
 
-        inputs = (typei, gparami, typej, gparamj, pos_dif, lq_dif)
+        inputs = (typei, gparami, typej, gparamj, pos_dif, quat_dif)
         uidx = jnp.triu_indices(NN, k=1)
         res1 = [x[...,uidx[0],uidx[1],:] for x in inputs]
         res2 = [einops.rearrange(x, 'i j k d -> i k j d')[...,uidx[0],uidx[1],:] for x in inputs]
@@ -261,27 +280,28 @@ class CNF(nn.Module):
         inputs = jax.tree_map(lambda *x : jnp.stack(x, axis=-2), res1, res2)
 
         col_res = self.col_query(*inputs)
-        return jnp.mean(col_res, axis=-1)
+        if col_res.shape[-2] == 1:
+            return jnp.squeeze(col_res, axis=-2)
+        else:
+            return jnp.mean(col_res, axis=-1)
 
 jkey = jax.random.PRNGKey(0)
-model = CNF(penetration_clip=penetration_clip)
+model = CNF(penetration_clip=PEN_CLIP)
 param = model.init(jkey, *test_data[0])
 
+model_apply_jit = jax.jit(model.apply)
 # %%
 # test
 res = model.apply(param, *test_data[0])
 
 # %%
 # def loss
-def loss_func(param, x, y, batch=False):
-    y_clip = jnp.clip(y, -penetration_clip, penetration_clip)
+def loss_func(param, x, y):
+    y_clip = jnp.clip(y, -PEN_CLIP, PEN_CLIP)
     yp = model.apply(param, *x)
     # loss = jnp.mean(yp[...,0,0:1]**2+(yp[...,0,1:2]-y)**2 + (yp[...,1,0:1]-y)**2, axis=-1)
-    loss = jnp.mean((yp-y_clip)**2, axis=-1)
-    if batch:
-        return loss
-    else:
-        return jnp.mean(loss)
+    loss = jnp.mean(jnp.abs(yp-y_clip), axis=-1)
+    return jnp.mean(loss)
 
 loss_func(param, *test_data)
 loss_func_jit = jax.jit(loss_func, static_argnums=[3])
@@ -293,47 +313,117 @@ optimizer = optax.adam(learning_rate=3e-4)
 opt_state = optimizer.init(param)
 step_no = 1
 def train_step(param, opt_state, x, y):
-    gap = int(x[0].shape[0]/step_no)
-    for i in range(step_no):
-        x_ = [xe[gap*i:gap*(i+1)] for xe in x]
-        value, grad = loss_func_value_and_grad(param, x_, y[gap*i:gap*(i+1)])
-        updates, opt_state = optimizer.update(grad, opt_state)
-        param = optax.apply_updates(param, updates)
-    value, grad = loss_func_value_and_grad(param, x_, y[gap*i:gap*(i+1)])
+    # gap = int(x[0].shape[0]/step_no)
+    # for i in range(step_no):
+    #     x_ = [xe[gap*i:gap*(i+1)] for xe in x]
+    #     value, grad = loss_func_value_and_grad(param, x_, y[gap*i:gap*(i+1)])
+    #     updates, opt_state = optimizer.update(grad, opt_state)
+    #     param = optax.apply_updates(param, updates)
+    value, grad = loss_func_value_and_grad(param, x, y)
     updates, opt_state = optimizer.update(grad, opt_state)
     param = optax.apply_updates(param, updates)
-    return param, opt_state, value
+    return param, opt_state, value, model.apply(param, *x)
 
 train_step_jit = jax.jit(train_step)
 
 # %%
+# replay buffer
+class replay_buffer:
+    def __init__(self, capacity=8000):
+        self.capacity = capacity
+        self.total_data = None
+        self.priority = None
+
+    def push(self, data, data_num, default_priority=2.0):
+        if self.total_data is None:
+            self.total_data = data
+            self.priority = default_priority*np.ones(data_num)
+        else:
+            sort_idx = np.argsort(self.priority)
+            self.total_data, self.priority = jax.tree_map(lambda x : x[sort_idx], [self.total_data, self.priority])
+            
+            self.total_data = jax.tree_map(lambda *x : np.concatenate(x, axis=0)[-self.capacity:], self.total_data, data)
+            self.priority = np.concatenate([self.priority, default_priority*np.ones(data_num)], axis=0)[-self.capacity:]
+
+
+    def sample(self, n):
+        tn = self.priority.shape[0]
+        idx = np.random.choice(np.arange(tn), size=[n], p=self.priority/np.sum(self.priority))
+        pick_td, pick_pty = jax.tree_map(lambda x : x[idx], [self.total_data, self.priority])
+        return pick_td, pick_pty, idx
+    
+    def update_priority(self, idx, priority):
+        self.priority[idx] = priority
+
+# %%
+# draw prediction results
+
+def eval_draw(param, ang1=0, ang2=0):
+    ns = 10000
+    type = np.array([[[1,0,0],[1,0,0]]])
+    gparam = np.array([[[0.05,0.032,0.055],[0.05,0.035,0.058]]])
+    quat = np.array([[sciR.from_euler('x', ang1).as_quat(),sciR.from_euler('x', ang2).as_quat()]])
+    type, gparam, quat = [einops.repeat(e, 'i j k -> (i tile) j k', tile=ns) 
+                for e in (type, gparam, quat)]
+    pos = np.random.uniform(-0.15,0.15,size=[ns,2])
+    pos = np.concatenate([np.zeros_like(pos[...,:1]), pos], axis=-1)
+    pos = np.stack([np.zeros_like(pos), pos], axis=-2)
+
+    res_gt, dir_gt = batch_query(type, gparam, pos, quat)
+    res_gt = np.clip(res_gt, -PEN_CLIP, PEN_CLIP)
+
+    res = model.apply(param, type, gparam, pos, quat)
+    res = np.mean(res, axis=-1)
+
+    plt.figure()
+    plt.subplot(1,2,1)
+    plt.scatter(pos[:,1,1], pos[:,1,2], s=5, c=res)
+    plt.subplot(1,2,2)
+    plt.scatter(pos[:,1,1], pos[:,1,2], s=5, c=res_gt)
+    plt.show()
+# %%
 # start train
-for i in range(2000):
-    x, y = make_dataset(ns=200, eval_func = lambda x,y: loss_func_jit(param, x,y, batch=True) )
-    param, opt_state, value = train_step_jit(param, opt_state, x, y)
-    # print(i, value)
+
+def get_priority(yp, y):
+    tau = 0.02
+    pred_dif = np.mean(np.abs(y - yp), axis=-1)
+    # log_val = -np.abs(np.mean(yp, axis=-1)) + np.std(yp, axis=-1) + pred_dif
+    log_val = np.std(yp, axis=-1) + pred_dif
+    log_val -= np.max(log_val)
+    return np.exp(log_val/tau)
+
+rb = replay_buffer()
+for i in range(9001):
+    x, y = make_dataset(ns=800)
+    rb.push((x, y), data_num = y.shape[0])
+    
+    for k in range(8):
+        data, _, data_idx = rb.sample(512)
+        param, opt_state, value, yp = train_step_jit(param, opt_state, *data)
+        rb.update_priority(data_idx, get_priority(yp, data[1]))
     if i % 100 == 0:
-        yp = model.apply(param, *x)
-        # acc = 1-jnp.abs(yp - y)
-        # acc = jnp.mean(acc)
-        print("loss {} // pred {} // gt {}".format(value, yp[-1], y[-1]))
-        # plt.figure()
-        # plt.imshow(get_rgb())
-        # plt.axis('off')
-        # plt.show()
+        print("loss {} // pred {} // gt {}".format(value, yp[-2:,0], y[-2:,0]))
+    if i % 1000 == 0:
+        eval_draw(param, ang2=0)
+        eval_draw(param, ang1=90*np.pi/180)
+        eval_draw(param, ang2=45*np.pi/180)
+        eval_draw(param, ang2=60*np.pi/180)
 
 with open('param.pickle', 'wb') as handle:
     pickle.dump(param, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 # %%
 # define jit func
+with open('param.pickle', 'rb') as handle:
+    param = pickle.load(handle)
+
 constraint_grad = jax.jacobian(lambda x, type, gparam: jnp.sum(model.apply(param, type, gparam, *x), axis=0))
 constraint_grad = jax.jit(constraint_grad)
 model_apply_jit = jax.jit(model.apply)
 
 
 # %%
-x = make_objs()
+x = make_objs(20, 0.15)
 
 # %%
 # physics evaulation
@@ -345,19 +435,14 @@ def physics_eval(x):
     frames = []
     fps = 20
     pp = 1/dt/fps
-    for i in range(3000):
+    free_idx = np.arange(12)
+    #pos[:,free_idx,2] += 0.2
+    tvel = np.zeros_like(pos)
+    avel = np.zeros_like(pos)
+    for i in range(5000):
         # print(i)
         penetration_value = model_apply_jit(param, type, gparam, pos, quat)
-        if np.min(penetration_value) < 0:
-            rpos, rquat = pos[-1], quat[-1]
-            for i in range(rpos.shape[0]):
-                p.resetBasePositionAndOrientation(i, rpos[i], rquat[i])
-            plt.figure()
-            plt.imshow(get_rgb())
-            plt.axis('off')
-            plt.show()
-
-        penetration_value = jnp.maximum(-penetration_value, 0)
+        penetration_value = jnp.maximum(-penetration_value-0.001, 0)
         constraints = constraint_grad((pos,quat), type, gparam)
         constrain_quat = constraints[1]
 
@@ -369,18 +454,24 @@ def physics_eval(x):
         constraint_concat = jnp.sum(constraint_concat * jnp.transpose(penetration_value, axes=[1,0])[:,:,None,None], axis=0)
         const_pos, const_zeta = constraint_concat[...,:3], constraint_concat[...,3:]
         
-        gain = 100.0 * dt
-        pos_impulse = gain * const_pos
-        gv_center = [0.2*np.sin(i*dt*5), -0.2*np.sin(i*dt*2), 0.2*np.cos(i*dt*5)]
-        gv_center = np.array(gv_center)
-        gv_acc = - 3.0 * (pos-gv_center)
-        pos = pos + pos_impulse/mass + gv_acc*dt  # last term => gravity
-
-        quat_gain = 8.0*dt
+        gain = 600.0 * dt
+        ang_gain = 500.0*dt
         inertia = 0.01
-        quat_impulse = quat_gain * const_zeta
-        quat = tutil.qmulti(quat, tutil.qexp(quat_impulse/inertia))
-        quat = quat/jnp.linalg.norm(quat, axis=-1, keepdims=True)
+        pos_impulse = gain * const_pos
+        ang_impulse = ang_gain * const_zeta
+        gv_center = [0.05*np.sin(i*dt*5), -0.1*np.sin(i*dt*2), 0.05*np.cos(i*dt*5)]
+        gv_center = np.array(gv_center)
+        gv_acc = - 6.0 * (pos-gv_center)
+        #gv_acc = np.array([0,0,-1])
+        tvel[:,free_idx] = (tvel + pos_impulse/mass + gv_acc*dt)[:,free_idx] 
+        avel[:,free_idx] = (avel + ang_impulse/inertia)[:,free_idx]
+        
+        # corriori term....
+
+        pos[:,free_idx] = (pos + tvel*dt)[:,free_idx]  # last term => gravity
+        quat[:,free_idx] = tutil.qmulti(quat, tutil.qexp(2*avel*dt))[:,free_idx]
+        #quat = quat/jnp.linalg.norm(quat, axis=-1, keepdims=True)
+
 
         # pybullet test
         if i%pp == 0:
