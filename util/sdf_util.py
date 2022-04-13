@@ -5,7 +5,7 @@ import jax
 import jaxlie as jl
 from functools import partial
 import time
-import jaxlie
+import transform_util as tutil
 
 def visualize_sdf(sdf_func):
     NS = 80
@@ -187,9 +187,10 @@ def box_sdf(h_ext):
     return lambda x : -jnp.min(h_ext-jnp.abs(x), axis=-1)
     # return lambda x : jax.nn.tanh(-1/sdf_crop_scale*jnp.min(h_ext-jnp.abs(x), axis=-1))*sdf_crop_scale
 
-def transform_sdf(sdf_func, SE3: jaxlie.SE3):
-    SE3_inv = SE3.inverse()
-    return lambda x : sdf_func(batch_operator(SE3_inv.apply, x))
+def transform_sdf(sdf_func, translate, rotate_quat):
+    # SE3_inv = SE3.inverse()
+    posquat_inv = tutil.pq_inv(translate, rotate_quat)
+    return lambda x : sdf_func(tutil.pq_action(*posquat_inv, x))
 
 def union_sdf(sdf_func1, sdf_func2):
     return lambda x : jnp.minimum(sdf_func1(x), sdf_func2(x))
