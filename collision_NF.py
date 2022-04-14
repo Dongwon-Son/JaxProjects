@@ -18,8 +18,10 @@ from scipy.spatial.transform.rotation import Rotation as sciR
 import random
 import pickle
 import jaxlie
+import functools
 
-PEN_CLIP= 0.010
+PEN_CLIP= 0.020
+GEO_HALFLEN_RANGE = [0.020, 0.070]
 
 # %%
 # query fcl
@@ -33,6 +35,8 @@ def fcl_query(type, gparam, pos, quat):
             g1 = fcl.Capsule(gp[0], gp[1])
         elif ty == 2:
             g1 = fcl.Cylinder(gp[0], gp[1])
+        elif ty == 3:
+            g1 = fcl.Sphere(gp[0])
         o_list.append(fcl.CollisionObject(g1, fcl.Transform()))
 
     drequest = fcl.DistanceRequest()
@@ -64,10 +68,10 @@ def batch_query(type, gparam, pos, quat):
     return ans, dir
 
 # %%
-def x_sample(outer_shape, pos_scale=0.13):
-    type = (np.random.randint(0, 3, size=outer_shape+[1]) == np.arange(3)).astype(np.float32)
+def x_sample(outer_shape, pos_scale=0.16):
+    type = (np.random.randint(0, 4, size=outer_shape+[1]) == np.arange(4)).astype(np.float32)
     # type = (np.random.randint(0, 1, size=outer_shape+[1]) == np.arange(3)).astype(np.float32) # test
-    gparam = np.random.uniform(0.03,0.06, size=outer_shape+[3])
+    gparam = np.random.uniform(*GEO_HALFLEN_RANGE, size=outer_shape+[3])
     pos = pos_scale*tutil.qrand(size=outer_shape+[4])[...,:3]
     quat = tutil.qrand(size=outer_shape+[4])
 
@@ -86,41 +90,61 @@ def x_sample(outer_shape, pos_scale=0.13):
 
     return type, gparam, pos, quat
 
-def x_sample_noise(x, ns):
-    type, gparam, pos, quat = x
-    gparam += np.random.normal(scale=0.01, size=gparam.shape)
-    gparam = np.clip(gparam, 0.02, 0.05)
-    pos += np.random.normal(scale=0.01, size=gparam.shape)
-    quat = tutilnp.qnoise(quat)
-    return type, gparam, pos, quat
+def x_sample_noise(x, ns=1):
+    res = []
+    for i in range(ns):
+        type, gparam, pos, quat = x
+        gparam += np.random.normal(scale=0.015, size=gparam.shape)
+        gparam = np.clip(gparam, *GEO_HALFLEN_RANGE)
+        pos += np.random.normal(scale=0.015, size=gparam.shape)
+        quat = tutilnp.qnoise(quat, scale = np.pi*20/180)
+        res.append((type, gparam, pos, quat))
+    res = [np.concatenate(zi, axis=0) for zi in zip(*res)]
+    return tuple(res)
 
 def make_dataset(ns):
-    while True:
-        x = x_sample([ns,2])
-        y, dir = batch_query(*x)
 
+    def devide_positive_negative(x,y,dir):
         res = [(x_[np.where(y[...,0]>0)], x_[np.where(y[...,0]<=0)]) for x_ in  x + (y,dir)]
         pnx, pny, pndir = res[:-2], res[-2], res[-1]
         px, nx = [x_[0] for x_ in pnx], [x_[1] for x_ in pnx]
         py, ny = pny
         pdir, ndir = pndir
         p_cnt, n_cnt = py.shape[0], ny.shape[0]
+        return px, nx, py, ny, pdir, ndir, p_cnt, n_cnt
 
-        def generate_proximity_data(x, len, dir, n=5, uniform_len=False):
-            type, gparam, pos, quat = x
-            if not uniform_len:
-                pos[:,0] += dir * len
-            type, gparam, pos, quat = [einops.repeat(e, '... i j -> ... tile i j', tile=n) for e in (type, gparam, pos, quat)]
-            if uniform_len:
-                len_distribution = len[...,None] * np.random.uniform(size=[len.shape[0],n,1])
-                pos[...,0,:] += dir[...,None,:] * len_distribution
-                return (type, gparam, pos, quat), len[...,None]-len_distribution
-            else:
-                len_distribution = np.random.normal(scale=0.02, size=[len.shape[0],n,1])
-                len_distribution = np.abs(len_distribution)
-                len_distribution[np.where(len[...,0]<0)] *= -1
-                pos[...,0,:] += -len_distribution * dir[...,None,:]
-                return (type, gparam, pos, quat), len_distribution
+    def generate_proximity_data(x, len, dir, n=5, uniform_len=False):
+        type, gparam, pos, quat = x
+        if not uniform_len:
+            pos[:,0] += dir * len
+        type, gparam, pos, quat = [einops.repeat(e, '... i j -> ... tile i j', tile=n) for e in (type, gparam, pos, quat)]
+        if uniform_len:
+            len_distribution = len[...,None] * np.random.uniform(size=[len.shape[0],n,1])
+            pos[...,0,:] += dir[...,None,:] * len_distribution
+            return (type, gparam, pos, quat), len[...,None]-len_distribution
+        else:
+            len_distribution = np.random.normal(scale=0.02, size=[len.shape[0],n,1])
+            len_distribution = np.abs(len_distribution)
+            len_distribution[np.where(len[...,0]<0)] *= -1
+            pos[...,0,:] += -len_distribution * dir[...,None,:]
+            return (type, gparam, pos, quat), len_distribution
+
+    while True:
+        x = x_sample([int(ns/2),2])
+        y, dir = batch_query(*x)
+        px, nx, py, ny, pdir, ndir, p_cnt, n_cnt = \
+                                    devide_positive_negative(x,y,dir)
+
+        while n_cnt/p_cnt < 0.65:
+            x_add = x_sample_noise(nx, 4)
+            y_add, dir_add = batch_query(*x_add)
+            res = [np.concatenate(zi, axis=0) for zi in zip(x+(y,dir), x_add+(y_add, dir_add))]
+            res = tuple(res)
+            x,y,dir = res[:-2], res[-2], res[-1]
+            px, nx, py, ny, pdir, ndir, p_cnt, n_cnt = \
+                                        devide_positive_negative(x,y,dir)
+            if n_cnt+p_cnt > ns*3:
+                break
 
         px_gen, py_gen = generate_proximity_data(px, py, pdir, n=2)
         # py_gt, pdir_gt = batch_query(*[e.reshape(-1,2,e.shape[-1]) for e in px_gen])
@@ -128,7 +152,7 @@ def make_dataset(ns):
         # pdir_gt = pdir_gt.reshape(-1,5,3)
         px_gen = [e.reshape(-1,2,e.shape[-1]) for e in px_gen]
 
-        nx_gen, ny_gen = generate_proximity_data(nx, ny, ndir, n=int(2*p_cnt/n_cnt), uniform_len=True)
+        nx_gen, ny_gen = generate_proximity_data(nx, ny, ndir, n=3, uniform_len=True)
         # ny_gt, ndir_gt = batch_query(*[e.reshape(-1,2,e.shape[-1]) for e in nx_gen])
         # ny_gt = ny_gt.reshape(-1,5,1)
         # ndir_gt = ndir_gt.reshape(-1,5,3)
@@ -199,7 +223,7 @@ def make_objs(obj_no, pos_scale=0.4):
             obj_id_list.append(p.createMultiBody(
                 baseMass=1,
                 baseCollisionShapeIndex=p.createCollisionShape(p.GEOM_SPHERE, radius=0.07),
-                baseVisualShapeIndex=p.createVisualShape(p.GEOM_SPHERE, radius=0.07,rgbaColor=np.random.uniform(4)),
+                baseVisualShapeIndex=p.createVisualShape(p.GEOM_SPHERE, radius=0.07,rgbaColor=np.random.uniform(size=4)),
             ))
         else:
             raise ValueError
@@ -213,7 +237,8 @@ def make_objs(obj_no, pos_scale=0.4):
 
 class CNF(nn.Module):
     penetration_clip: float
-    feature_dim: int = 256
+    feature_dim: int = 128
+    rel_distance_limit: float = 0.250
 
     def positional_embedding(self, x, embedding_size=10):
         pe = []
@@ -224,14 +249,15 @@ class CNF(nn.Module):
         return x
 
     @nn.compact
-    def col_query(self, type1, gparam1, type2, gparam2, pos2, quat2):
-        gparam1 = nn.BatchNorm(True)(gparam1)
-        gparam2 = nn.BatchNorm(True)(gparam2)
-        rel_pos_limit = 0.20
+    def __call__(self, type1, gparam1, type2, gparam2, pos2, quat2):
+        # gparam1 = nn.BatchNorm(True)(gparam1)
+        # gparam2 = nn.BatchNorm(True)(gparam2)
+        gparam1 = (gparam1 - np.mean(GEO_HALFLEN_RANGE))*1.9/(GEO_HALFLEN_RANGE[1]-GEO_HALFLEN_RANGE[0])
+        gparam2 = (gparam2 - np.mean(GEO_HALFLEN_RANGE))*1.9/(GEO_HALFLEN_RANGE[1]-GEO_HALFLEN_RANGE[0])
         quat_mask = (quat2[...,-1:] > 0).astype(jnp.float32)
         quat = quat2 * quat_mask + (-quat2) * (1-quat_mask)
-        far_mask = jnp.any(jnp.abs(pos2) > rel_pos_limit, axis=-1).astype(jnp.float32)
-        pos = self.positional_embedding(pos2/rel_pos_limit)
+        far_mask = jnp.any(jnp.abs(pos2) > self.rel_distance_limit, axis=-1).astype(jnp.float32)
+        pos = self.positional_embedding(pos2/self.rel_distance_limit)
         quat = self.positional_embedding(quat, 6)
         gparam1 = self.positional_embedding(gparam1, 6)
         gparam2 = self.positional_embedding(gparam2, 6)
@@ -246,7 +272,7 @@ class CNF(nn.Module):
         x += skip
 
         for i in range(2):
-            x = nn.Dense(self.feature_dim)(x)
+            x = nn.Dense(int(self.feature_dim/2))(x)
             x = nn.relu(x)
             if i == 0:
                 skip = x
@@ -257,50 +283,72 @@ class CNF(nn.Module):
         x = jnp.squeeze(x, axis=-1)
         return x * (1-far_mask) + self.penetration_clip*far_mask
 
-    # def penetration_and_constraint(self, param, inputs):
-        
+def cull(pos_dif, nn, k):
+    distance = jnp.linalg.norm(pos_dif, axis=-1)
+    uidx = jnp.triu_indices(nn, k=1)
+    if k > uidx[0].shape[0]:
+        sort_idx = einops.repeat(jnp.arange(uidx[0].shape[-1]), 'i -> b i', b=distance.shape[0])
+    else:
+        sort_idx = jnp.argsort(distance, axis=-1)[...,:k]
     
-    def __call__(self, type, gparam, pos, quat):
-        
-        NN = pos.shape[-2]
-        typei, gparami, posi, quati = jax.tree_map(
-                            lambda x : einops.repeat(x, 'i j k -> i j tile k', tile=NN),
-                                         (type, gparam, pos, quat))
-        typej, gparamj, posj, quatj = jax.tree_map(
-                            lambda x : einops.repeat(x, 'i j k -> i tile j k', tile=NN),
-                                         (type, gparam, pos, quat))
+    return (uidx[0][sort_idx], uidx[1][sort_idx]), sort_idx
 
-        pos_dif, quat_dif = tutil.pq_multi(*tutil.pq_inv(posi, quati), posj, quatj)
+def make_model_input(type, gparam, pos, quat, cull_k=100):
+    NN = pos.shape[-2]
+    uidx = jnp.triu_indices(NN, k=1)
+    posi, quati = jax.tree_map(lambda x: x[...,uidx[0],:], (pos, quat))
+    posj, quatj = jax.tree_map(lambda x: x[...,uidx[1],:], (pos, quat))
 
-        inputs = (typei, gparami, typej, gparamj, pos_dif, quat_dif)
-        uidx = jnp.triu_indices(NN, k=1)
-        res1 = [x[...,uidx[0],uidx[1],:] for x in inputs]
-        res2 = [einops.rearrange(x, 'i j k d -> i k j d')[...,uidx[0],uidx[1],:] for x in inputs]
-        
-        inputs = jax.tree_map(lambda *x : jnp.stack(x, axis=-2), res1, res2)
+    pos_dif, quat_dif = tutil.pq_multi(*tutil.pq_inv(posi, quati), posj, quatj)
 
-        col_res = self.col_query(*inputs)
-        if col_res.shape[-2] == 1:
-            return jnp.squeeze(col_res, axis=-2)
-        else:
-            return jnp.mean(col_res, axis=-1)
+    cull_idx_ij, sort_idx_after_ut = cull(pos_dif, nn=NN, k=cull_k)
+    pos_dif_ij = jnp.take_along_axis(pos_dif, sort_idx_after_ut[...,None], axis=-2)
+    quat_dif_ij = jnp.take_along_axis(quat_dif, sort_idx_after_ut[...,None], axis=-2)
+
+    pos_dif_ji, quat_dif_ji = tutil.pq_inv(pos_dif_ij, quat_dif_ij)
+
+    typei, gparami = \
+        jax.tree_map(lambda x : jnp.take_along_axis(x, cull_idx_ij[0][...,None], axis=-2), (type, gparam))
+    typej, gparamj = \
+        jax.tree_map(lambda x : jnp.take_along_axis(x, cull_idx_ij[1][...,None], axis=-2), (type, gparam))
+
+    inputs = [(typei, gparami, typej, gparamj, pos_dif_ij, quat_dif_ij), (typej, gparamj, typei, gparami, pos_dif_ji, quat_dif_ji)]
+    inputs = jax.tree_map(lambda *x : jnp.stack(x, axis=-2), *inputs)
+    return inputs, cull_idx_ij, sort_idx_after_ut
+
+
+def collision_query(model, param, type, gparam, pos, quat, cull_k=100):
+    NN = pos.shape[-2]
+    inputs, cull_idx_ij, sort_idx_after_ut = \
+            make_model_input(type, gparam, pos, quat, cull_k=cull_k)
+    col_res = model.apply(param, *inputs)
+    if NN == 2:
+        return jnp.squeeze(col_res, axis=-2)
+    else:
+        full_col_res = PEN_CLIP*jnp.ones([pos.shape[0], int(NN*(NN-1)/2)])
+        iidx = einops.repeat(jnp.arange(pos.shape[0]), 'i -> i tile', tile=sort_idx_after_ut.shape[-1])
+        full_col_res = full_col_res.at[iidx, sort_idx_after_ut].set(jnp.mean(col_res, axis=-1))
+        return full_col_res
 
 jkey = jax.random.PRNGKey(0)
 model = CNF(penetration_clip=PEN_CLIP)
-param = model.init(jkey, *test_data[0])
+param = model.init(jkey, *make_model_input(*test_data[0])[0])
 
 model_apply_jit = jax.jit(model.apply)
 # %%
 # test
-res = model.apply(param, *test_data[0])
+# res = collision_query(model, param, *test_data[0])
+x_test = x_sample([2,4])
+collision_query(model, param, *x_test, cull_k=6)
+collision_query(model, param, *x_test, cull_k=7)
 
 # %%
 # def loss
 def loss_func(param, x, y):
     y_clip = jnp.clip(y, -PEN_CLIP, PEN_CLIP)
-    yp = model.apply(param, *x)
+    yp = collision_query(model, param, *x)
     # loss = jnp.mean(yp[...,0,0:1]**2+(yp[...,0,1:2]-y)**2 + (yp[...,1,0:1]-y)**2, axis=-1)
-    loss = jnp.mean(jnp.abs(yp-y_clip), axis=-1)
+    loss = jnp.mean(jnp.abs(yp-y_clip)/PEN_CLIP, axis=-1)
     return jnp.mean(loss)
 
 loss_func(param, *test_data)
@@ -313,23 +361,17 @@ optimizer = optax.adam(learning_rate=3e-4)
 opt_state = optimizer.init(param)
 step_no = 1
 def train_step(param, opt_state, x, y):
-    # gap = int(x[0].shape[0]/step_no)
-    # for i in range(step_no):
-    #     x_ = [xe[gap*i:gap*(i+1)] for xe in x]
-    #     value, grad = loss_func_value_and_grad(param, x_, y[gap*i:gap*(i+1)])
-    #     updates, opt_state = optimizer.update(grad, opt_state)
-    #     param = optax.apply_updates(param, updates)
     value, grad = loss_func_value_and_grad(param, x, y)
     updates, opt_state = optimizer.update(grad, opt_state)
     param = optax.apply_updates(param, updates)
-    return param, opt_state, value, model.apply(param, *x)
+    return param, opt_state, value, collision_query(model, param, *x)
 
 train_step_jit = jax.jit(train_step)
 
 # %%
 # replay buffer
 class replay_buffer:
-    def __init__(self, capacity=8000):
+    def __init__(self, capacity=9000):
         self.capacity = capacity
         self.total_data = None
         self.priority = None
@@ -360,8 +402,8 @@ class replay_buffer:
 
 def eval_draw(param, ang1=0, ang2=0):
     ns = 10000
-    type = np.array([[[1,0,0],[1,0,0]]])
-    gparam = np.array([[[0.05,0.032,0.055],[0.05,0.035,0.058]]])
+    type = np.array([[[1,0,0,0],[1,0,0,0]]])
+    gparam = np.array([[[0.05,0.03,0.06],[0.05,0.03,0.06]]])
     quat = np.array([[sciR.from_euler('x', ang1).as_quat(),sciR.from_euler('x', ang2).as_quat()]])
     type, gparam, quat = [einops.repeat(e, 'i j k -> (i tile) j k', tile=ns) 
                 for e in (type, gparam, quat)]
@@ -372,7 +414,7 @@ def eval_draw(param, ang1=0, ang2=0):
     res_gt, dir_gt = batch_query(type, gparam, pos, quat)
     res_gt = np.clip(res_gt, -PEN_CLIP, PEN_CLIP)
 
-    res = model.apply(param, type, gparam, pos, quat)
+    res = collision_query(model, param, type, gparam, pos, quat)
     res = np.mean(res, axis=-1)
 
     plt.figure()
@@ -383,7 +425,6 @@ def eval_draw(param, ang1=0, ang2=0):
     plt.show()
 # %%
 # start train
-
 def get_priority(yp, y):
     tau = 0.02
     pred_dif = np.mean(np.abs(y - yp), axis=-1)
@@ -393,85 +434,93 @@ def get_priority(yp, y):
     return np.exp(log_val/tau)
 
 rb = replay_buffer()
-for i in range(9001):
-    x, y = make_dataset(ns=800)
+for i in range(100001):
+    x, y = make_dataset(ns=700)
     rb.push((x, y), data_num = y.shape[0])
     
-    for k in range(8):
+    for k in range(9):
         data, _, data_idx = rb.sample(512)
         param, opt_state, value, yp = train_step_jit(param, opt_state, *data)
         rb.update_priority(data_idx, get_priority(yp, data[1]))
     if i % 100 == 0:
         print("loss {} // pred {} // gt {}".format(value, yp[-2:,0], y[-2:,0]))
-    if i % 1000 == 0:
+    if i % 5000 == 0:
         eval_draw(param, ang2=0)
         eval_draw(param, ang1=90*np.pi/180)
         eval_draw(param, ang2=45*np.pi/180)
         eval_draw(param, ang2=60*np.pi/180)
-
-with open('param.pickle', 'wb') as handle:
-    pickle.dump(param, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    if i%10000 == 0:
+        with open('param.pickle', 'wb') as handle:
+            pickle.dump(param, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 # %%
 # define jit func
 with open('param.pickle', 'rb') as handle:
     param = pickle.load(handle)
-
-constraint_grad = jax.jacobian(lambda x, type, gparam: jnp.sum(model.apply(param, type, gparam, *x), axis=0))
-constraint_grad = jax.jit(constraint_grad)
-model_apply_jit = jax.jit(model.apply)
-
+x = make_objs(15, 0.20)
 
 # %%
-x = make_objs(20, 0.15)
+# function def and parameters
+cull_k = 50
+free_idx = np.arange(12)
+BN = 1
+
+constraint_grad = jax.jacobian(lambda x, type, gparam: 
+        jnp.sum(collision_query(model, param, type, gparam, *x, cull_k=cull_k), axis=0))
+x = jax.tree_map(lambda x : jnp.tile(x, [BN,1,1]), x)
 
 # %%
 # physics evaulation
-def physics_eval(x):
-    type, gparam, pos, quat = [e[None] for e in x]
-    NN = type.shape[1]
-    dt = 0.001
+
+@jax.jit
+def dynamic_step(dt, free_idx, param, type, gparam, pos, quat, tvel, avel, ext_force):
+    NN = pos.shape[-2]
+    penetration_value = collision_query(model, param, type, gparam, pos, quat, cull_k=cull_k)
+    penetration_bias = 0.003
+    penetration_value = jnp.maximum(-penetration_value+penetration_bias, 0)
+    raw_pos_const, raw_quat_const = constraint_grad((pos,quat), type, gparam)
+    
+    zeta = tutil.qmulti(tutil.qinv(quat), raw_quat_const)[...,:3] # log quaternion
+    constraint_concat = jnp.concatenate([raw_pos_const, zeta], axis=-1)
+    const_norm = jnp.maximum(jnp.linalg.norm(constraint_concat, axis=-1, keepdims=True), 1e-6)
+    constraint_concat = constraint_concat / const_norm
+    
+    constraint_concat = jnp.sum(constraint_concat * jnp.transpose(penetration_value, axes=[1,0])[:,:,None,None], axis=0)
+    const_pos, const_zeta = constraint_concat[...,:3], constraint_concat[...,3:]
+    
+    # integrations
+    pos_gain = 6000.0
+    ang_gain = pos_gain * 10
     mass = 1.0
+    inertia = 0.01
+    dv_contact = pos_gain * const_pos * dt
+    dw_contact = ang_gain * const_zeta * dt
+    drag = 0.999
+    tvel = tvel.at[:,free_idx].set((tvel*drag + dv_contact + ext_force/mass*dt)[:,free_idx])
+    avel = avel.at[:,free_idx].set((avel*drag + dw_contact - jnp.cross(avel, avel)*dt)[:,free_idx])
+    
+    pos = pos.at[:,free_idx].set((pos + tvel*dt)[:,free_idx])
+    quat = quat.at[:, free_idx].set(tutil.qmulti(quat, tutil.qexp(2*avel*dt))[:,free_idx]) 
+    quat = quat/jnp.linalg.norm(quat, axis=-1, keepdims=True)
+    return pos, quat, tvel, avel
+
+
+def physics_eval(x):
+    # type, gparam, pos, quat = [jnp.asarray(e[None]) for e in x]
+    type, gparam, pos, quat = x
+    dt = 0.001
     frames = []
     fps = 20
     pp = 1/dt/fps
-    free_idx = np.arange(12)
     #pos[:,free_idx,2] += 0.2
-    tvel = np.zeros_like(pos)
-    avel = np.zeros_like(pos)
+    tvel = jnp.zeros_like(pos)
+    avel = jnp.zeros_like(pos)
     for i in range(5000):
-        # print(i)
-        penetration_value = model_apply_jit(param, type, gparam, pos, quat)
-        penetration_value = jnp.maximum(-penetration_value-0.001, 0)
-        constraints = constraint_grad((pos,quat), type, gparam)
-        constrain_quat = constraints[1]
-
-        zeta = tutil.qmulti(tutil.qinv(quat), constrain_quat)[...,:3] # log quaternion
-        constraint_concat = jnp.concatenate([constraints[0], zeta], axis=-1)
-        const_norm = jnp.maximum(jnp.linalg.norm(constraint_concat, axis=-1, keepdims=True), 1e-6)
-        constraint_concat = constraint_concat / const_norm
-        
-        constraint_concat = jnp.sum(constraint_concat * jnp.transpose(penetration_value, axes=[1,0])[:,:,None,None], axis=0)
-        const_pos, const_zeta = constraint_concat[...,:3], constraint_concat[...,3:]
-        
-        gain = 600.0 * dt
-        ang_gain = 500.0*dt
-        inertia = 0.01
-        pos_impulse = gain * const_pos
-        ang_impulse = ang_gain * const_zeta
         gv_center = [0.05*np.sin(i*dt*5), -0.1*np.sin(i*dt*2), 0.05*np.cos(i*dt*5)]
         gv_center = np.array(gv_center)
         gv_acc = - 6.0 * (pos-gv_center)
-        #gv_acc = np.array([0,0,-1])
-        tvel[:,free_idx] = (tvel + pos_impulse/mass + gv_acc*dt)[:,free_idx] 
-        avel[:,free_idx] = (avel + ang_impulse/inertia)[:,free_idx]
-        
-        # corriori term....
-
-        pos[:,free_idx] = (pos + tvel*dt)[:,free_idx]  # last term => gravity
-        quat[:,free_idx] = tutil.qmulti(quat, tutil.qexp(2*avel*dt))[:,free_idx]
-        #quat = quat/jnp.linalg.norm(quat, axis=-1, keepdims=True)
-
+        # gv_acc = np.array([0,0,-1])
+        pos, quat, tvel, avel = dynamic_step(dt, free_idx, param, type, gparam, pos, quat, tvel, avel, gv_acc)
 
         # pybullet test
         if i%pp == 0:
@@ -486,4 +535,5 @@ def physics_eval(x):
 physics_eval(x)
 Image('test.gif')
 
+# %%
 # %%
