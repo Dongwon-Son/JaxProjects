@@ -5,7 +5,10 @@ import jax
 import jaxlie as jl
 from functools import partial
 import time
-import transform_util as tutil
+try:
+    import transform_util as tutil
+except:
+    import util.transform_util as tutil
 
 def visualize_sdf(sdf_func):
     NS = 80

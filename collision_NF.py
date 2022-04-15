@@ -222,8 +222,8 @@ def make_objs(obj_no, pos_scale=0.4):
         elif ty == 3:
             obj_id_list.append(p.createMultiBody(
                 baseMass=1,
-                baseCollisionShapeIndex=p.createCollisionShape(p.GEOM_SPHERE, radius=0.07),
-                baseVisualShapeIndex=p.createVisualShape(p.GEOM_SPHERE, radius=0.07,rgbaColor=np.random.uniform(size=4)),
+                baseCollisionShapeIndex=p.createCollisionShape(p.GEOM_SPHERE, radius=gp[0]),
+                baseVisualShapeIndex=p.createVisualShape(p.GEOM_SPHERE, radius=gp[0], rgbaColor=np.random.uniform(size=4)),
             ))
         else:
             raise ValueError
@@ -283,8 +283,18 @@ class CNF(nn.Module):
         x = jnp.squeeze(x, axis=-1)
         return x * (1-far_mask) + self.penetration_clip*far_mask
 
-def cull(pos_dif, nn, k):
+def cull(pos_dif, nn, k, fix_idx=None):
     distance = jnp.linalg.norm(pos_dif, axis=-1)
+
+    if fix_idx is not None:
+        fix_utidx = jnp.triu_indices(fix_idx.shape[-1], k=1)
+        fix_idx_i = fix_idx[..., fix_utidx[0]]
+        fix_idx_j = fix_idx[..., fix_utidx[1]]
+        fix_idx_fut = ((nn-1 + nn-(fix_idx_i-1)-1) * (fix_idx_i) * 0.5 + fix_idx_j - fix_idx_i - 1).astype(jnp.int32)
+        if len(fix_idx.shape) == 1:
+            distance = distance.at[:, fix_idx_fut].add(100)
+        else:
+            distance = distance.at[jnp.tile(jnp.arange(distance.shape[0])[...,None], [1, fix_idx_fut.shape[-1]]), fix_idx_fut].add(100)
     uidx = jnp.triu_indices(nn, k=1)
     if k > uidx[0].shape[0]:
         sort_idx = einops.repeat(jnp.arange(uidx[0].shape[-1]), 'i -> b i', b=distance.shape[0])
@@ -293,7 +303,7 @@ def cull(pos_dif, nn, k):
     
     return (uidx[0][sort_idx], uidx[1][sort_idx]), sort_idx
 
-def make_model_input(type, gparam, pos, quat, cull_k=100):
+def make_model_input(type, gparam, pos, quat, cull_k=100, fix_idx=None):
     NN = pos.shape[-2]
     uidx = jnp.triu_indices(NN, k=1)
     posi, quati = jax.tree_map(lambda x: x[...,uidx[0],:], (pos, quat))
@@ -301,7 +311,7 @@ def make_model_input(type, gparam, pos, quat, cull_k=100):
 
     pos_dif, quat_dif = tutil.pq_multi(*tutil.pq_inv(posi, quati), posj, quatj)
 
-    cull_idx_ij, sort_idx_after_ut = cull(pos_dif, nn=NN, k=cull_k)
+    cull_idx_ij, sort_idx_after_ut = cull(pos_dif, nn=NN, k=cull_k, fix_idx=fix_idx)
     pos_dif_ij = jnp.take_along_axis(pos_dif, sort_idx_after_ut[...,None], axis=-2)
     quat_dif_ij = jnp.take_along_axis(quat_dif, sort_idx_after_ut[...,None], axis=-2)
 
@@ -317,10 +327,10 @@ def make_model_input(type, gparam, pos, quat, cull_k=100):
     return inputs, cull_idx_ij, sort_idx_after_ut
 
 
-def collision_query(model, param, type, gparam, pos, quat, cull_k=100):
+def collision_query(model, param, type, gparam, pos, quat, cull_k=100, fix_idx=None):
     NN = pos.shape[-2]
     inputs, cull_idx_ij, sort_idx_after_ut = \
-            make_model_input(type, gparam, pos, quat, cull_k=cull_k)
+            make_model_input(type, gparam, pos, quat, cull_k=cull_k, fix_idx=fix_idx)
     col_res = model.apply(param, *inputs)
     if NN == 2:
         return jnp.squeeze(col_res, axis=-2)
@@ -339,8 +349,10 @@ model_apply_jit = jax.jit(model.apply)
 # test
 # res = collision_query(model, param, *test_data[0])
 x_test = x_sample([2,4])
-collision_query(model, param, *x_test, cull_k=6)
-collision_query(model, param, *x_test, cull_k=7)
+fix_idx = np.arange(2)
+collision_query(model, param, *x_test, cull_k=6, fix_idx=fix_idx)
+fix_idx = einops.repeat(fix_idx, 'i -> tile i', tile=2)
+collision_query(model, param, *x_test, cull_k=7, fix_idx=fix_idx)
 
 # %%
 # def loss
@@ -419,9 +431,9 @@ def eval_draw(param, ang1=0, ang2=0):
 
     plt.figure()
     plt.subplot(1,2,1)
-    plt.scatter(pos[:,1,1], pos[:,1,2], s=5, c=res)
+    plt.scatter(pos[:,1,1], pos[:,1,2], s=5, c=np.abs(res))
     plt.subplot(1,2,2)
-    plt.scatter(pos[:,1,1], pos[:,1,2], s=5, c=res_gt)
+    plt.scatter(pos[:,1,1], pos[:,1,2], s=5, c=np.abs(res_gt))
     plt.show()
 # %%
 # start train
@@ -434,7 +446,7 @@ def get_priority(yp, y):
     return np.exp(log_val/tau)
 
 rb = replay_buffer()
-for i in range(100001):
+for i in range(10000001):
     x, y = make_dataset(ns=700)
     rb.push((x, y), data_num = y.shape[0])
     
@@ -442,14 +454,14 @@ for i in range(100001):
         data, _, data_idx = rb.sample(512)
         param, opt_state, value, yp = train_step_jit(param, opt_state, *data)
         rb.update_priority(data_idx, get_priority(yp, data[1]))
-    if i % 100 == 0:
-        print("loss {} // pred {} // gt {}".format(value, yp[-2:,0], y[-2:,0]))
-    if i % 5000 == 0:
+    if i % 1000 == 0:
+        print("itr {} // loss {} // pred {} // gt {}".format(i, value, yp[-2:,0], y[-2:,0]))
+    if i % 10000 == 0:
         eval_draw(param, ang2=0)
         eval_draw(param, ang1=90*np.pi/180)
         eval_draw(param, ang2=45*np.pi/180)
         eval_draw(param, ang2=60*np.pi/180)
-    if i%10000 == 0:
+    if i%20000 == 0:
         with open('param.pickle', 'wb') as handle:
             pickle.dump(param, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -457,26 +469,29 @@ for i in range(100001):
 # define jit func
 with open('param.pickle', 'rb') as handle:
     param = pickle.load(handle)
-x = make_objs(15, 0.20)
+obj_no = 40
+x = make_objs(obj_no, 0.20)
 
 # %%
 # function def and parameters
 cull_k = 50
-free_idx = np.arange(12)
+fix_idx = jnp.arange(20)
+tmp_idx = jnp.zeros(obj_no)
+free_idx = jnp.where(tmp_idx.at[fix_idx].add(100)==0)[0]
 BN = 1
 
 constraint_grad = jax.jacobian(lambda x, type, gparam: 
-        jnp.sum(collision_query(model, param, type, gparam, *x, cull_k=cull_k), axis=0))
+        jnp.sum(collision_query(model, param, type, gparam, *x, cull_k=cull_k, fix_idx=fix_idx), axis=0))
 x = jax.tree_map(lambda x : jnp.tile(x, [BN,1,1]), x)
 
 # %%
 # physics evaulation
 
-@jax.jit
-def dynamic_step(dt, free_idx, param, type, gparam, pos, quat, tvel, avel, ext_force):
+@functools.partial(jax.jit, static_argnums=(0,))
+def dynamic_step(dt, fix_idx, free_idx, param, type, gparam, pos, quat, tvel, avel, ext_force):
     NN = pos.shape[-2]
-    penetration_value = collision_query(model, param, type, gparam, pos, quat, cull_k=cull_k)
-    penetration_bias = 0.003
+    penetration_value = collision_query(model, param, type, gparam, pos, quat, cull_k=cull_k, fix_idx=fix_idx)
+    penetration_bias = 0.00
     penetration_value = jnp.maximum(-penetration_value+penetration_bias, 0)
     raw_pos_const, raw_quat_const = constraint_grad((pos,quat), type, gparam)
     
@@ -489,15 +504,15 @@ def dynamic_step(dt, free_idx, param, type, gparam, pos, quat, tvel, avel, ext_f
     const_pos, const_zeta = constraint_concat[...,:3], constraint_concat[...,3:]
     
     # integrations
-    pos_gain = 6000.0
+    pos_gain = 1000.0
     ang_gain = pos_gain * 10
     mass = 1.0
     inertia = 0.01
     dv_contact = pos_gain * const_pos * dt
     dw_contact = ang_gain * const_zeta * dt
-    drag = 0.999
-    tvel = tvel.at[:,free_idx].set((tvel*drag + dv_contact + ext_force/mass*dt)[:,free_idx])
-    avel = avel.at[:,free_idx].set((avel*drag + dw_contact - jnp.cross(avel, avel)*dt)[:,free_idx])
+    drag_coef = 0.5
+    tvel = tvel.at[:,free_idx].set((tvel-drag_coef*dt*tvel + dv_contact + ext_force/mass*dt)[:,free_idx])
+    avel = avel.at[:,free_idx].set((avel-drag_coef*dt*avel + dw_contact - jnp.cross(avel, avel)*dt)[:,free_idx])
     
     pos = pos.at[:,free_idx].set((pos + tvel*dt)[:,free_idx])
     quat = quat.at[:, free_idx].set(tutil.qmulti(quat, tutil.qexp(2*avel*dt))[:,free_idx]) 
@@ -520,7 +535,7 @@ def physics_eval(x):
         gv_center = np.array(gv_center)
         gv_acc = - 6.0 * (pos-gv_center)
         # gv_acc = np.array([0,0,-1])
-        pos, quat, tvel, avel = dynamic_step(dt, free_idx, param, type, gparam, pos, quat, tvel, avel, gv_acc)
+        pos, quat, tvel, avel = dynamic_step(dt, fix_idx, free_idx, param, type, gparam, pos, quat, tvel, avel, gv_acc)
 
         # pybullet test
         if i%pp == 0:
