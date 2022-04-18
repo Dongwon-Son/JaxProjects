@@ -70,14 +70,34 @@ class DecSDF(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        # frequency expand
         out_bound_mask = jnp.array(jnp.concatenate([x >= 1.0, x <= -1.0], axis=-1), dtype=jnp.float32)
         out_bound_mask = jnp.max(out_bound_mask, axis=-1)
-        fx = []
-        for i in range(10):
-            fx.append((jnp.cos((2**i)*jnp.pi*x)))
-            fx.append((jnp.sin((2**i)*jnp.pi*x)))
-        x = jnp.concatenate(fx, axis=-1)
+
+        # frequency expand
+        # fx = []
+        # for i in range(10):
+        #     fx.append((jnp.cos((2**i)*jnp.pi*x)))
+        #     fx.append((jnp.sin((2**i)*jnp.pi*x)))
+        # x = jnp.concatenate(fx, axis=-1)
+
+        # hashing expand
+        F = 2
+        N_list = [4,9,17]
+        y_list = []
+        for n in N_list:
+            h = self.param('h'+str(n), nn.initializers.lecun_normal(), 
+                                    (n+1, n+1, n+1, F), jnp.float32)
+            corner_idx = jnp.floor((x+1)*n/2).astype(jnp.int32)
+            tmp_idx = jnp.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1],
+                                    [1,1,0],[1,0,1],[0,1,1],[1,1,1]], jnp.int32)
+            hash_idx = corner_idx[...,None,:] + tmp_idx
+            residual = hash_idx - (x[...,None,:]+1) /2 *n
+            y = h[hash_idx[...,0],hash_idx[...,1],hash_idx[...,2]]
+            y_weights = jnp.prod(jnp.abs(residual), axis=-1, keepdims=True)
+            y = jnp.sum(y_weights * y, axis=-2)
+            y_list.append(y)
+        x = jnp.concatenate(y_list, axis=-1)
+
         for _ in range(3):
             x = nn.Dense(128)(x)
             x = nn.relu(x)
@@ -128,7 +148,7 @@ data = batch_data_gen()
 
 # %%
 # init networks
-dec = DecSDF(1.0)
+dec = DecSDF(0.4)
 
 jkey =jax.random.PRNGKey(0)
 dec_param = dec.init(jkey, data[0])
@@ -140,7 +160,7 @@ sdfvae_loss(params, jkey, dec, data)
 
 # %%
 # visualization
-def visualize_sdf(params, jkey, data):
+def visualize_sdf(params):
     def sdf_func(x):
         origin_shape = x.shape
         x_expanded = jnp.reshape(x, (-1, 3))
@@ -151,15 +171,23 @@ def visualize_sdf(params, jkey, data):
     cam_SE3 = jl.SE3.from_rotation(rotation=view_SO3) @ \
         jl.SE3.from_rotation_and_translation(rotation=jl.SO3(jnp.array([1,0,0,0],dtype=jnp.float32)), translation=jnp.array([0,0,-2.0]))
     light_position = jnp.array([-1.5,1.0,2.0])
-
     depth_gen = sdfu.sdf_renderer_exact(sdf_func, cam_SE3=cam_SE3, far=3, light_position=light_position)
+    
+    # visualize sections
+    x_sample = np.random.uniform(-1,1,[10000,3])
+    x_sample[:,1] = 0
+    # x_sample = x_sample.at[:,1].set(0)
+    sdf_res = sdf_func(x_sample)
+
     plt.figure()
+    plt.subplot(1,2,1)
     plt.imshow(depth_gen)
+    plt.axis('off')
+    plt.subplot(1,2,2)
+    plt.scatter(x_sample[:,0], x_sample[:,2], s=5.0, c=np.abs(sdf_res))
     plt.axis('off')
     plt.show()
 
-
-# visualize_sdf(params, jkey, data)
 
 # %% init optimizer
 optimizer = optax.adam(learning_rate=5e-4)
@@ -179,7 +207,10 @@ for ep in range(EPOCH):
         data = batch_data_gen()
         loss, params, opt_state = train_step(jkey, params, data, opt_state)
     if ep%10 == 0 :
-        visualize_sdf(params, jkey, data)
+        visualize_sdf(params)
         print(loss)
+
+# %%
+visualize_sdf(params)
 
 # %%

@@ -1,18 +1,23 @@
-# try:
-#     import quat_util as qutil
-# except:
-#     import util.quat_util as qutil
-
 import jax.numpy as jnp
 import numpy as np
+import jax
+import einops
 
 # quaternion operations
+def normalize(vec):
+    return vec/(jnp.linalg.norm(vec, axis=-1, keepdims=True) + 1e-8)
 
 def quw2wu(quw):
     return jnp.concatenate([quw[...,-1:], quw[...,:3]], axis=-1)
 
-def qrand(size):
-    q1 = np.random.normal(size=size)
+def qrand(outer_shape, jkey=None):
+    if jkey is None:
+        return qrand_np(outer_shape)
+    else:
+        return normalize(jax.random.normal(jkey, outer_shape + (4,)))
+
+def qrand_np(outer_shape):
+    q1 = np.random.normal(size=outer_shape+(4,))
     q1 = q1 / np.linalg.norm(q1, axis=-1, keepdims=True)
     return q1
 
@@ -42,6 +47,13 @@ def q2aa(q):
 def aa2q(aa):
     return qexp(aa*0.5)
 
+def q2R(q):
+    i,j,k,r = jnp.split(q, 4, axis=-1)
+    R1 = jnp.concatenate([1-2*(j**2+k**2), 2*(i*j-k*r), 2*(i*k+j*r)], axis=-1)
+    R2 = jnp.concatenate([2*(i*j+k*r), 1-2*(i**2+k**2), 2*(j*k-i*r)], axis=-1)
+    R3 = jnp.concatenate([2*(i*k-j*r), 2*(j*k+i*r), 1-2*(i**2+j**2)], axis=-1)
+    return jnp.stack([R1,R2,R3], axis=-2)
+
 def qexp(logq):
     alpha = jnp.linalg.norm(logq, axis=-1, keepdims=True)
     alpha = jnp.maximum(alpha, 1e-6)
@@ -64,3 +76,7 @@ def pq_action(translate, rotate, pnt):
 
 def pq_multi(pos1, quat1, pos2, quat2):
     return qaction(quat1, pos2)+pos1, qmulti(quat1, quat2)
+
+# general
+def T(mat):
+    return einops.rearrange(mat, '... i j -> ... j i')

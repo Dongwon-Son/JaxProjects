@@ -109,6 +109,7 @@ def sdf_renderer(sdf_func, depth_out=False, cam_SE3=None, color=jnp.array([230/2
 def sdf_renderer_exact(sdf_func, cam_SE3=None, near=0.01, far=2.0, light_position=jnp.array([0.2,0.2,1]), color=jnp.array([230/255, 9/255, 101/255]), background_color=jnp.array([1,1,1])):
     # hyper parameters
     NS = 20
+    marching_itr = 50
     PIXEL_SIZE =  [120, 120]
     cam_zeta = [PIXEL_SIZE[1]*0.8, PIXEL_SIZE[0]*0.8, 0.5*(PIXEL_SIZE[1]-1), 0.5*(PIXEL_SIZE[0]-1)]
     spec_alpha = 5
@@ -148,7 +149,7 @@ def sdf_renderer_exact(sdf_func, cam_SE3=None, near=0.01, far=2.0, light_positio
     # batch ray marching
     ray_sample_pnts = rays_s[...,None,:] + ray_dir[...,None,:] * jnp.arange(NS)[...,None]/NS
     sd_res = sdf_func(ray_sample_pnts)
-    for _ in range(20):
+    for _ in range(marching_itr):
         ray_sample_pnts += sd_res[...,None]*ray_dir_normalized[...,None,:]
         sd_res = sdf_func(ray_sample_pnts)
     boundary_mask = jnp.array(jnp.abs(sd_res) < 5e-5, jnp.float32)
@@ -181,19 +182,57 @@ def sdf_renderer_exact(sdf_func, cam_SE3=None, near=0.01, far=2.0, light_positio
     img = jnp.clip(img, 0, 1)
     return img
 
-# sdf_crop_scale = 0.10
 def sphere_sdf(r):
     return lambda x : -r+jnp.linalg.norm(x, axis=-1)
-    # return lambda x : jax.nn.tanh(-1/sdf_crop_scale*(r-jnp.linalg.norm(x, axis=-1)))*sdf_crop_scale
 
 def box_sdf(h_ext):
-    return lambda x : -jnp.min(h_ext-jnp.abs(x), axis=-1)
-    # return lambda x : jax.nn.tanh(-1/sdf_crop_scale*jnp.min(h_ext-jnp.abs(x), axis=-1))*sdf_crop_scale
+    def sdf_func(x):
+        positive_pnts_from_boundary = jnp.abs(x) - h_ext
+        min_dist = jnp.linalg.norm(jax.nn.relu(positive_pnts_from_boundary), axis=-1)
+        return min_dist*(min_dist!=0).astype(min_dist.dtype) +\
+             jnp.max(positive_pnts_from_boundary, axis=-1)*(min_dist==0).astype(min_dist.dtype)
+    return sdf_func
 
-def transform_sdf(sdf_func, translate, rotate_quat):
-    # SE3_inv = SE3.inverse()
+def box_round_sdf(h_ext, re):
+    return lambda x : box_sdf(h_ext-re)(x) - re
+
+def cylinder_sdf(r, half_h):
+    def sdf_func(x):
+        rh_limit = jnp.concatenate([jnp.array(r)[...,None], jnp.array(half_h)[...,None]], axis=-1)
+        rh = jnp.concatenate([jnp.linalg.norm(x[...,:2], axis=-1, keepdims=True), x[...,2:]], axis=-1)
+        positive_rh_from_boundary = jnp.abs(rh) - rh_limit
+        min_dist = jnp.linalg.norm(jax.nn.relu(positive_rh_from_boundary), axis=-1)
+        return min_dist*(min_dist!=0).astype(min_dist.dtype) +\
+             jnp.max(positive_rh_from_boundary, axis=-1)*(min_dist==0).astype(min_dist.dtype)
+    return sdf_func
+
+def cylinder_round_sdf(r, half_h, re):
+    return lambda x : cylinder_sdf(r-re, half_h-re)(x) - re
+
+def capsule_sdf(r,h):
+    hz = jnp.zeros_like(h)
+    hz = jnp.stack([hz, hz, 0.5*h], axis=-1)
+    return union_sdf( 
+            union_sdf(transform_sdf(sphere_sdf(r), hz), 
+                    transform_sdf(sphere_sdf(r), -hz))
+                    ,cylinder_sdf(r*0.99,h)
+                    )
+
+def primitive_sdf(geo_param):
+    type, param = geo_param[...,0:1].astype(jnp.int32), geo_param[...,1:]
+    def sdf_func(x):
+        sdf1 = box_round_sdf(param, 0.002)(x)
+        sdf2 = capsule_sdf(param[...,0], param[...,2])(x)
+        sdf3 = cylinder_round_sdf(param[...,0], param[...,2], 0.002)(x)
+        sdf4 = sphere_sdf(param[...,0])(x)
+        sdfs = jnp.stack([sdf1, sdf2, sdf3, sdf4], axis=-1)
+        return jnp.take_along_axis(sdfs, type, axis=-1)
+    
+    return sdf_func
+
+def transform_sdf(sdf_func, translate=jnp.array([0,0,0]), rotate_quat=jnp.array([0,0,0,1]), scale=1):
     posquat_inv = tutil.pq_inv(translate, rotate_quat)
-    return lambda x : sdf_func(tutil.pq_action(*posquat_inv, x))
+    return lambda x : sdf_func(tutil.pq_action(*posquat_inv, x)/scale)*scale
 
 def union_sdf(sdf_func1, sdf_func2):
     return lambda x : jnp.minimum(sdf_func1(x), sdf_func2(x))
@@ -213,7 +252,11 @@ if __name__ == '__main__':
     import matplotlib.pyplot as plt
 
     # sdf_func = sphere_sdf(0.8)
-    sdf_func = union_sdf(sphere_sdf(0.6), box_sdf(np.array([0.8,0.1,0.1])))
+    # sdf_func = union_sdf(sphere_sdf(0.6), box_sdf(np.array([0.8,0.1,0.1])))
+    sdf_func = capsule_sdf(0.8, 0.4)
+    # sdf_func = transform_sdf(sdf_func, scale=2)
+    # sdf_func = box_sdf(np.array([0.4,0.5,0.6]))
+    # sdf_func = cylinder_sdf(0.4, 0.2)
 
     view_SO3 = jl.SO3.from_x_radians(jnp.pi+jnp.pi/8)@jl.SO3.from_y_radians(jnp.pi/8)
     cam_SE3 = jl.SE3.from_rotation(rotation=view_SO3) @ \
@@ -231,4 +274,6 @@ if __name__ == '__main__':
     plt.imshow(img)
     plt.axis('off')
     plt.show()
+# %%
+
 # %%

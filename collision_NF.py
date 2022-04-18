@@ -197,7 +197,6 @@ def make_objs(obj_no, pos_scale=0.4):
     x = x_sample([obj_no], pos_scale=pos_scale)
     p.resetSimulation()
     obj_id_list = []
-    obj_type_list = []
 
     for ty, gp, ps, qt in zip(*x):
         ty = np.argmax(ty)

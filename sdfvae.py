@@ -137,12 +137,32 @@ class DecSDF(nn.Module):
     def __call__(self, x, z):
         out_bound_mask = jnp.array(jnp.concatenate([x >= 1.0, x <= -1.0], axis=-1), dtype=jnp.float32)
         out_bound_mask = jnp.max(out_bound_mask, axis=-1)
+        
         # frequency expand
-        fx = []
-        for i in range(10):
-            fx.append(jnp.cos((2**i)*np.pi*x))
-            fx.append(jnp.sin((2**i)*np.pi*x))
-        x = jnp.concatenate(fx, axis=-1)
+        # fx = []
+        # for i in range(10):
+        #     fx.append(jnp.cos((2**i)*np.pi*x))
+        #     fx.append(jnp.sin((2**i)*np.pi*x))
+        # x = jnp.concatenate(fx, axis=-1)
+        
+        # hashing table
+        F = 2
+        N_list = [4,9,13,17]
+        y_list = []
+        for n in N_list:
+            h = self.param('h'+str(n), nn.initializers.lecun_normal(), 
+                                    (n+1, n+1, n+1, F), jnp.float32)
+            corner_idx = jnp.floor((x+1)*n/2).astype(jnp.int32)
+            tmp_idx = jnp.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1],
+                                    [1,1,0],[1,0,1],[0,1,1],[1,1,1]], jnp.int32)
+            hash_idx = corner_idx[...,None,:] + tmp_idx
+            residual = hash_idx - (x[...,None,:]+1) /2 *n
+            y = h[hash_idx[...,0],hash_idx[...,1],hash_idx[...,2]]
+            y_weights = jnp.prod(jnp.abs(residual), axis=-1, keepdims=True)
+            y = jnp.sum(y_weights * y, axis=-2)
+            y_list.append(y)
+        x = jnp.concatenate(y_list, axis=-1)
+
         z = jnp.expand_dims(z, axis=-2)
         z_tile = jnp.tile(z, (1, x.shape[1], 1))
         x = jnp.concatenate([x, z_tile], axis=-1)
@@ -171,15 +191,6 @@ def sdfvae_loss(params, jkey, enc, dec, data):
     occ_real = jnp.clip(data[1][1], -dec.clip_value, dec.clip_value)
     
     def cal_loss(y_pred, y_real):
-        # binary cross entropy
-        # rec_loss = occ_real * jnp.log(occ_pred) + (1-occ_real) * jnp.log(1-occ_pred)
-        # rec_loss = -rec_loss
-        # focal loss
-        # p = y_real*y_pred + (1-y_real) * (1-y_pred)
-        # alpha = 0.5
-        # gamma = 2
-        # rec_loss = -alpha*(1-p)**gamma*jnp.log(p)
-
         sq_dif = jnp.square(y_pred - y_real)
         return  jnp.mean(sq_dif, axis=-1)
     
@@ -216,7 +227,7 @@ data = batch_data_gen()
 # %%
 # init networks
 enc = Encoder()
-dec = DecSDF(0.15)
+dec = DecSDF(0.4)
 
 jkey =jax.random.PRNGKey(0)
 enc_param = enc.init(jkey, data[0])
@@ -286,12 +297,11 @@ def train_step(jkey, params, data, opt_state):
     return loss, params, opt_state
 
 for ep in range(EPOCH):
-    for _ in range(100):
-        data = batch_data_gen()
-        _, jkey = jax.random.split(jkey)
-        loss, params, opt_state = train_step(jkey, params, data, opt_state)
-    if ep%10 == 0 :
+    data = batch_data_gen()
+    _, jkey = jax.random.split(jkey)
+    loss, params, opt_state = train_step(jkey, params, data, opt_state)
+    if ep%500 == 0 :
         visualize_sdf(params, jkey, data)
-        print(loss)
+        print("ep {} // loss {}".format(ep,loss))
 
 # %%
