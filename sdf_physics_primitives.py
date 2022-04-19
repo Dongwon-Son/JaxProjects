@@ -7,6 +7,7 @@ import numpy as np
 import einops
 from moviepy.editor import ImageSequenceClip
 from IPython.display import Image
+import time
 
 import util.sdf_util as sdfutil
 import util.transform_util as tutil
@@ -89,15 +90,8 @@ def cull_idx(pos, k, fix_idx=None):
     sort_idx = jnp.argsort(distanceij)[...,:k]
     return oi_idx[sort_idx], oj_idx[sort_idx]
 
-
-def dynamics_step(jkey, geo_param, pos, quat, scale, twist, ext_wrench, 
-                    cull_k, fix_idx, dt, mass, inertia, gain, cp_no, gain_b):
-    no = geo_param.shape[-2]
-
+def calculate_contact_points(jkey, cp_no, geo_paramij, posij, quatij, scaleij, culli):
     # get contact points
-    culli, cullj = cull_idx(pos, cull_k, fix_idx)
-    geo_paramij, posij, quatij, scaleij, twistij = jax.tree_map(lambda x : jnp.stack([jnp.take_along_axis(x, culli[...,None], axis=-2), jnp.take_along_axis(x, cullj[...,None], axis=-2)], axis=-2), 
-                        (geo_param, pos, quat, scale, twist))
     ns = cp_no
     x_samples_ij = jax.random.uniform(jkey, posij.shape[:-2] + (ns,3), posij.dtype, -1, 1)
     x_samples_i = tutil.pq_action(posij[...,0:1,:], quatij[...,0:1,:], x_samples_ij[...,:int(ns/2),:]/scaleij[...,0:1,:]/geo_paramij[...,0:1,1:])
@@ -109,61 +103,93 @@ def dynamics_step(jkey, geo_param, pos, quat, scale, twist, ext_wrench,
         _, jkey = jax.random.split(jkey)
         sdf, grad = intsc_sdf_grad(x_samples, *addparams, min_value=0.00) # (NB, NR, NS)
         x_samples -= grad*jnp.maximum(sdf[...,None], 0.001)
-    con_pnt_ijs = einops.repeat(x_samples, '... i -> ... 2 i')
-    sdfijs, gradijs = sdf_grad(con_pnt_ijs, *addparams)
-    normalijs = -sdfutil.normalize(gradijs)
-    normalijs = normalijs[...,0,:] - normalijs[...,1,:]
-    normalijs = jnp.stack([normalijs, -normalijs], axis=-2)
-    normalijs = sdfutil.normalize(normalijs)
+    csdf_sij, grad_sij = sdf_grad(einops.repeat(x_samples, '... i -> ... 2 i'), *addparams)
+    cps_si = x_samples
+    normal_sij_tmp = sdfutil.normalize(grad_sij)
+    normal_si = normal_sij_tmp[...,0,:] - normal_sij_tmp[...,1,:]
+    normal_si = sdfutil.normalize(normal_si)
 
     # plane_normal normal
-    normalijs_plane = jnp.zeros_like(normalijs).at[...,0,2].set(-1)
-    normalijs_plane = normalijs_plane.at[...,1,2].set(1)
-    normalijs = jnp.where(einops.repeat(culli, '... i -> ... i ns nij 1', ns=ns, nij=2)==0, normalijs_plane, normalijs)
+    norma_si_plane = jnp.zeros_like(normal_si).at[...,2].set(1)
+    cns_si = jnp.where(einops.repeat(culli, '... i -> ... i ns 1', ns=ns)==0, norma_si_plane, normal_si)
+    
+    return jnp.stack([cps_si, cps_si], axis=-2), jnp.stack([cns_si, -cns_si], axis=-2), csdf_sij
 
-    pdijs = jnp.maximum(-sdfijs, 0)
-    con_vel_ijs = twistij[...,None,:,:3] + jnp.cross(twistij[...,None,:,3:], con_pnt_ijs - posij[...,None,:,:])
-    rel_con_vel_ijs = con_vel_ijs[...,0:1,:] - con_vel_ijs[...,1:2,:]
-    rel_con_vel_ijs = jnp.concatenate([rel_con_vel_ijs, -rel_con_vel_ijs], axis=-2)
-    rel_con_normal_vel_ijs = jnp.sum(rel_con_vel_ijs*normalijs, axis=-1, keepdims=True)
-    # con_impulse_value = (pdijs[...,None] * gain + rel_con_normal_vel_ijs * jnp.sqrt(gain))
-    con_impulse_value = (pdijs[...,None] * gain - rel_con_normal_vel_ijs * gain_b)
-    con_impulse_ijs = normalijs * con_impulse_value
 
-    n_mask = jnp.where((con_impulse_value>0) & (rel_con_normal_vel_ijs<=0.0001) & (jnp.max(sdfijs, axis=-1, keepdims=True)[...,None] < 0.0001), 1, 0)
-    con_impulse_ijs = con_impulse_ijs * n_mask
-    con_impulse_is = con_impulse_ijs[...,0,:] - con_impulse_ijs[...,1,:]
-    con_impulse_ijs = jnp.stack([con_impulse_is, -con_impulse_is], axis=-2)
+def dynamics_step(jkey, geo_param, pos, quat, scale, twist, ext_wrench, 
+                    cull_k, fix_idx, dt, mass, inertia, cp_no, baumgarte_erp, elasticity, mu, substep):
+    no = geo_param.shape[-2]
+    
+    for _ in range(substep):
+        _, jkey = jax.random.split(jkey)
+        # cull and pick i j objects
+        culli, cullj = cull_idx(pos, cull_k, fix_idx)
+        cull_ij = jnp.stack([culli, cullj], axis=-1)
+        geo_paramij, posij, quatij, scaleij, twistij = jax.tree_map(lambda x : jnp.stack([jnp.take_along_axis(x, culli[...,None], axis=-2), jnp.take_along_axis(x, cullj[...,None], axis=-2)], axis=-2), 
+                            (geo_param, pos, quat, scale, twist))
+        
+        # get contact points
+        cps_sij, cns_sij, csdf_sij = calculate_contact_points(jkey, cp_no, geo_paramij, posij, quatij, scaleij, culli)
+        cpd_sij = jnp.maximum(-csdf_sij, 0)
 
-    impulse_ijs = jnp.concatenate([con_impulse_ijs, jnp.cross((con_pnt_ijs - addparams[1]), con_impulse_ijs)], axis=-1)
-    impulse_ij = jnp.sum(impulse_ijs, axis=-3)
+        # get contact velocities
+        relpos_sij = cps_sij - posij[...,None,:,:]
+        cvel_sij = twistij[...,None,:,:3] + jnp.cross(twistij[...,None,:,3:], cps_sij - posij[...,None,:,:])
+        cvel_si_vec = cvel_sij[...,0,:] - cvel_sij[...,1,:]
+        cvel_n_value = jnp.sum(cvel_si_vec*cns_sij[...,0,:], axis=-1)
+        cvel_n_si_vec = cvel_n_value[...,None] * cns_sij[...,0,:]
+        cvel_d_si_vec = cvel_si_vec - cvel_n_si_vec
+        cvel_d_value = jnp.linalg.norm(cvel_d_si_vec, axis=-1)
+        cvel_d_si_dir = cvel_d_si_vec / (1e-6 + cvel_d_value[...,None])
 
-    impulse_ijmat = jnp.zeros(impulse_ij.shape[:-3]+(no,no,6))
-    nr = culli.shape[-1]
-    batch_idx = einops.repeat(jnp.arange(impulse_ij.shape[0]), 'i -> i nr', nr=nr)
-    impulse_ijmat = impulse_ijmat.at[batch_idx, culli, cullj].set(impulse_ij[...,0,:])
-    impulse_ijmat = impulse_ijmat.at[batch_idx, cullj, culli].set(impulse_ij[...,1,:])
+        # contact resolution
+        baumgarte_vel_value_sij = baumgarte_erp * cpd_sij
+        tmp_sij = inertia * jnp.cross(relpos_sij, cns_sij[...,0:1,:])
+        tmp_sij = jnp.where(einops.repeat(cull_ij, '... i j -> ... i ns j 1', ns=tmp_sij.shape[-3])==0, 0, tmp_sij)
+        ang_s = jnp.sum(cns_sij[...,0,:] * jnp.sum(jnp.cross(tmp_sij, relpos_sij), axis=-2), axis=-1)
 
-    con_impulse = jnp.sum(impulse_ijmat, axis=-2)
+        imp_n_s_value = ((1. + elasticity) * cvel_n_value + jnp.sum(baumgarte_vel_value_sij, axis=-1)) / (
+                        1. / mass + 1. / mass + ang_s)
 
-    Imat_b = jnp.diag(jnp.array([inertia,inertia,inertia]))
-    Imat = tutil.qaction(quat[...,None,:], Imat_b[None,None])
-    Imat = tutil.qaction(quat[...,None,:], einops.rearrange(Imat, '... i j -> ... j i'))
-    Imat = einops.rearrange(Imat, '... i j -> ... j i')
-    Imat_inv = jnp.linalg.inv(Imat)
+        # friction contact
+        imp_d_s_value = cvel_d_value / (1./mass + 1./mass + ang_s)
+        imp_d_s_value = jnp.minimum(imp_d_s_value, mu * imp_n_s_value)
 
-    Iw = jnp.einsum('...ij,...j->...i',Imat, twist[...,3:])
-    twist = twist.at[...,:3].set(twist[...,:3] + con_impulse[...,:3]/mass + ext_wrench[...,:3]/mass*dt)
-    twist = twist.at[...,3:].set(twist[...,3:] + jnp.einsum('...ij,...j->...i',Imat_inv, con_impulse[...,3:]) + jnp.einsum('...ij,...j->...i',Imat_inv, jnp.cross(twist[...,3:], Iw)*dt))
-    twist = twist.at[...,fix_idx,:].set(0)
+        # calculate dp
+        apply_n_si = jnp.where((jnp.max(csdf_sij, axis=-1) <= 0.0001) & (cvel_n_value >= -0.0001) & (imp_n_s_value > 0.), 1., 0.)
+        apply_d_si = apply_n_si * jnp.where(cvel_d_value > 0.01, 1., 0.)
+        imp_nd_si_vec = -apply_n_si[..., None] * imp_n_s_value[...,None] * cns_sij[...,0,:] - \
+                        apply_d_si[..., None] * imp_d_s_value[...,None] * cvel_d_si_dir
+        imp_nd_sij_vec = jnp.stack([imp_nd_si_vec, -imp_nd_si_vec], axis=-2)
+        dp_sij = jnp.concatenate([imp_nd_sij_vec, jnp.cross(relpos_sij, imp_nd_sij_vec)], axis=-1)
+        dp_ij = jnp.sum(dp_sij, axis=-3) / (1e-6+jnp.sum(apply_n_si, axis=-1, keepdims=True))[..., None]
 
-    pos += twist[...,:3] * dt
-    quat = tutil.qmulti(tutil.qexp(twist[...,3:]*dt/2), quat)
+        # recover dp_mat
+        dp_mat = jnp.zeros((dp_ij.shape[0], no, no, 6))
+        nr = culli.shape[-1]
+        batch_idx = einops.repeat(jnp.arange(dp_ij.shape[0]), 'i -> i nr', nr=nr)
+        dp_mat = dp_mat.at[batch_idx, culli, cullj].set(dp_ij[...,0,:])
+        dp_mat = dp_mat.at[batch_idx, cullj, culli].set(dp_ij[...,1,:])
+        dp_o = jnp.sum(dp_mat, axis=-2)
 
+        # integration
+        Imat_b = jnp.diag(jnp.array([inertia,inertia,inertia]))
+        Imat = tutil.qaction(quat[...,None,:], Imat_b[None,None])
+        Imat = tutil.qaction(quat[...,None,:], einops.rearrange(Imat, '... i j -> ... j i'))
+        Imat = einops.rearrange(Imat, '... i j -> ... j i')
+        Imat_inv = jnp.linalg.inv(Imat)
+
+        Iw = jnp.einsum('...ij,...j->...i',Imat, twist[...,3:])
+        twist = twist.at[...,:3].set(twist[...,:3] + dp_o[...,:3]/mass + ext_wrench[...,:3]/mass*dt)
+        twist = twist.at[...,3:].set(twist[...,3:] + jnp.einsum('...ij,...j->...i',Imat_inv, dp_o[...,3:]) + jnp.einsum('...ij,...j->...i',Imat_inv, jnp.cross(twist[...,3:], Iw)*dt))
+        twist = twist.at[...,fix_idx,:].set(0)
+
+        pos += twist[...,:3] * dt
+        quat = tutil.qmulti(tutil.qexp(twist[...,3:]*dt/2), quat)
 
     return pos, quat, twist
 
-dynamics_step_jit = jax.jit(dynamics_step, static_argnames=['cp_no', 'cull_k', 'mass', 'dt', 'inertia'])
+dynamics_step_jit = jax.jit(dynamics_step, static_argnames=['cp_no', 'cull_k', 'mass', 'inertia', 'substep'])
 
 # %%
 # physical test init
@@ -171,12 +197,12 @@ prutil.init()
 
 # %%
 # param random
-NB = 2
-NO = 30
+NB = 1
+NO = 20
 inputs = random_param(jkey, (NB,NO))
 
 # test primitives
-# inputs = (jnp.array([[2,1,1,1]], dtype=jnp.float32), jnp.array([[0.1,0.1,0.50]], dtype=jnp.float32), jnp.array([[np.sin(np.pi/12),0,0,np.cos(np.pi/12)]], dtype=jnp.float32), jnp.array([[0.080]], dtype=jnp.float32))
+# inputs = (jnp.array([[0,1,1,1]], dtype=jnp.float32), jnp.array([[0.1,0.1,0.10]], dtype=jnp.float32), jnp.array([[np.sin(np.pi/12),0,0,np.cos(np.pi/12)]], dtype=jnp.float32), jnp.array([[0.080]], dtype=jnp.float32))
 # inputs = jax.tree_map(lambda x : einops.repeat(x, 'i j -> tile i j', tile=NB), inputs)
 
 # add table - should be index 0!!!
@@ -191,19 +217,21 @@ prutil.make_objs(geo_param[-1], pos[-1], quat[-1], scale[-1])
 geo_param, pos, quat, scale = inputs
 physics_param = {}
 physics_param['mass'] = 1.0
-physics_param['inertia'] = 0.01
-physics_param['dt'] = 0.003
+physics_param['inertia'] = 0.02
+physics_param['dt'] = 0.001
+physics_param['substep'] = 5
 physics_param['cull_k'] = 80
-physics_param['gain'] = 5
-physics_param['gain_b'] = 0.05
+physics_param['baumgarte_erp'] = 40.0
+physics_param['elasticity'] = 0
+physics_param['mu'] = 0.3
 physics_param['cp_no'] = 6
-# physics_param['fix_idx'] = jnp.arange(1).astype(jnp.int32)
 physics_param['fix_idx'] = jnp.array([0]).astype(jnp.int32)
 twist = jnp.zeros(pos.shape[:-1] + (6,), dtype=jnp.float32)
 frames = []
-fps = 21
-pp = int(1/physics_param['dt']/fps)
-for i in range(1000):
+fps = 20
+pp = int(1/physics_param['dt']/physics_param['substep']/fps)
+st = time.time()
+for i in range(400):
     _, jkey = jax.random.split(jkey)
     gv_force = -9.81 * jnp.ones_like(pos) * physics_param['mass']
     gv_force = gv_force.at[:,:,:2].set(0)
@@ -211,17 +239,36 @@ for i in range(1000):
     pos, quat, twist = dynamics_step_jit(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
     # pos, quat, twist = dynamics_step(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
 
-    # pybullet test
+    # pybullet capture
     if i%pp == 0:
+        print('dt : {}'.format((time.time() - st)/pp))
         rpos, rquat = pos[-1], quat[-1]
         for j in range(rpos.shape[0]):
             p.resetBasePositionAndOrientation(j, rpos[j], rquat[j])
-        # frames.append(prutil.get_rgb([0,0.8,0.0]))
         frames.append(prutil.get_rgb([0,0.6,0.6]))
+        st = time.time()
 
 clip = ImageSequenceClip(list(frames), fps=fps)
 clip.write_gif('test.gif', fps=fps)
 
 Image('test.gif')
 
+# %%
+# %timeit dynamics_step_jit(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
+# %%
+# total iteration jit time
+def dynamics_itr(jkey, geo_param, pos, quat, scale, twist, ext_wrench, 
+                    cull_k, fix_idx, dt, mass, inertia, gain, cp_no, gain_b):
+    for i in range(1000):
+        _, jkey = jax.random.split(jkey)
+        gv_force = -9.81 * jnp.ones_like(pos) * mass
+        gv_force = gv_force.at[:,:,:2].set(0)
+        ext_wrench = jnp.concatenate([gv_force, jnp.zeros_like(gv_force)], axis=-1)
+        # pos, quat, twist = dynamics_step_jit(jkey, geo_param, pos, quat, scale, twist, ext_wrench, cull_k, fix_idx, dt, mass, inertia, gain, cp_no, gain_b)
+        pos, quat, twist = dynamics_step(jkey, geo_param, pos, quat, scale, twist, ext_wrench, cull_k, fix_idx, dt, mass, inertia, gain, cp_no, gain_b)
+    return pos, quat, twist
+
+dynamics_itr_jit = jax.jit(dynamics_itr, static_argnames=['cp_no', 'cull_k', 'mass', 'dt', 'inertia'])
+
+# %timeit dynamics_itr_jit(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
 # %%
