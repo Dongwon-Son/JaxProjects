@@ -40,23 +40,34 @@ def random_param(jkey, outer_shape=(1,)):
 
 # %%
 # intersect sdf value and grad
-def intsc_sdf(x, geo_paramij, posij, quatij, scaleij, min_value=0):
+def box_intsc_sdf(x, posij, quatij, scaleij):
+    sdfij = sdfutil.transform_sdf(sdfutil.box_round_sdf(jnp.array([0.98,0.98,0.98]), 0.01), posij, quatij, scaleij)(einops.repeat(x, '... k -> ... 2 k'))
+    sdf = jnp.max(sdfij, axis=-2)
+    return sdf[...,0]
+
+def intsc_sdf(x, geo_paramij, posij, quatij, scaleij):
     sdfij = sdfutil.transform_sdf(sdfutil.primitive_sdf(geo_paramij), posij, quatij, scaleij)(einops.repeat(x, '... k -> ... 2 k'))
     sdf = jnp.max(sdfij, axis=-2)
-    # return jnp.maximum(sdf[...,0], 0)
     return sdf[...,0]
 
 def sdf_func(x, geo_param, pos, quat, scale):
     sdf = sdfutil.transform_sdf(sdfutil.primitive_sdf(geo_param), pos, quat, scale)(x)
     return sdf[...,0]
 
+flat_box_intsc_sdf_grad = jax.vmap(jax.value_and_grad(box_intsc_sdf))
 flat_intsc_sdf_grad = jax.vmap(jax.value_and_grad(intsc_sdf))
 flat_sdf_grad = jax.vmap(jax.value_and_grad(sdf_func))
 
-def intsc_sdf_grad(*inputs, min_value=0):
+def box_intsc_sdf_grad(*inputs):
     origin_outer_shape = inputs[0].shape[:-1]
     inputs_flat = jax.tree_map(lambda x : x.reshape((-1,)+ x.shape[len(origin_outer_shape):]), inputs)
-    sdf, grad = flat_intsc_sdf_grad(*inputs_flat, min_value=einops.repeat(jnp.array(min_value), ' -> nb', nb=inputs_flat[0].shape[0]))
+    sdf, grad = flat_box_intsc_sdf_grad(*inputs_flat)
+    return sdf.reshape(origin_outer_shape), grad.reshape(origin_outer_shape + (grad.shape[-1],))
+
+def intsc_sdf_grad(*inputs):
+    origin_outer_shape = inputs[0].shape[:-1]
+    inputs_flat = jax.tree_map(lambda x : x.reshape((-1,)+ x.shape[len(origin_outer_shape):]), inputs)
+    sdf, grad = flat_intsc_sdf_grad(*inputs_flat)
     return sdf.reshape(origin_outer_shape), grad.reshape(origin_outer_shape + (grad.shape[-1],))
 
 def sdf_grad(*inputs):
@@ -99,9 +110,17 @@ def calculate_contact_points(jkey, cp_no, geo_paramij, posij, quatij, scaleij, c
     x_samples_i = jnp.where(einops.repeat(culli, '... i -> ... i ns 1', ns=int(ns/2))==0, x_samples_j.at[...,2].set(-x_samples_j[...,2]), x_samples_i) ## if plane.. opposite samples
     x_samples = jnp.concatenate([x_samples_i, x_samples_j], axis=-2)
     addparams = jax.tree_map(lambda x : einops.repeat(x, '... i j -> ... ns i j', ns=ns) , (geo_paramij, posij, quatij, scaleij))
+
+    # broad phase
+    for _ in range(2):
+        _, jkey = jax.random.split(jkey)
+        sdf, grad = box_intsc_sdf_grad(x_samples, *addparams[1:])
+        x_samples -= grad*jnp.maximum(sdf[...,None], 0.001)
+
+    # narrow phase
     for _ in range(3):
         _, jkey = jax.random.split(jkey)
-        sdf, grad = intsc_sdf_grad(x_samples, *addparams, min_value=0.00) # (NB, NR, NS)
+        sdf, grad = intsc_sdf_grad(x_samples, *addparams) # (NB, NR, NS)
         x_samples -= grad*jnp.maximum(sdf[...,None], 0.001)
     csdf_sij, grad_sij = sdf_grad(einops.repeat(x_samples, '... i -> ... 2 i'), *addparams)
     cps_si = x_samples
@@ -236,8 +255,8 @@ for i in range(400):
     gv_force = -9.81 * jnp.ones_like(pos) * physics_param['mass']
     gv_force = gv_force.at[:,:,:2].set(0)
     ext_wrench = jnp.concatenate([gv_force, jnp.zeros_like(gv_force)], axis=-1)
-    pos, quat, twist = dynamics_step_jit(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
-    # pos, quat, twist = dynamics_step(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
+    # pos, quat, twist = dynamics_step_jit(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
+    pos, quat, twist = dynamics_step(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
 
     # pybullet capture
     if i%pp == 0:

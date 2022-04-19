@@ -13,11 +13,12 @@ import glob
 import optax
 import functools
 import jaxlie as jl
+import pickle
 
 import util.sdf_util as sdfu
 
 # %% hyper parameters
-mesh_list = glob.glob('obj_mesh/*/meshes/*.obj')[:100]
+mesh_list = glob.glob('obj_mesh/*/meshes/*.obj')[:20]
 pic_dict = {}
 sdf_label_dict = {}
 scene_dict = {}
@@ -106,7 +107,8 @@ def gen_one_data():
         pic_dict[pick_mesh_dir] = img_res
 
     return img_res, sdf_label_res, mesh_list.index(pick_mesh_dir)
-    
+
+
 # %%
 # network design
 class Encoder(nn.Module):
@@ -139,35 +141,35 @@ class DecSDF(nn.Module):
         out_bound_mask = jnp.max(out_bound_mask, axis=-1)
         
         # frequency expand
-        # fx = []
-        # for i in range(10):
-        #     fx.append(jnp.cos((2**i)*np.pi*x))
-        #     fx.append(jnp.sin((2**i)*np.pi*x))
-        # x = jnp.concatenate(fx, axis=-1)
+        fx = []
+        for i in range(8):
+            fx.append(jnp.cos((2**i)*np.pi*x))
+            fx.append(jnp.sin((2**i)*np.pi*x))
+        x = jnp.concatenate(fx, axis=-1)
         
-        # hashing table
-        F = 2
-        N_list = [4,9,13,17]
-        y_list = []
-        for n in N_list:
-            h = self.param('h'+str(n), nn.initializers.lecun_normal(), 
-                                    (n+1, n+1, n+1, F), jnp.float32)
-            corner_idx = jnp.floor((x+1)*n/2).astype(jnp.int32)
-            tmp_idx = jnp.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1],
-                                    [1,1,0],[1,0,1],[0,1,1],[1,1,1]], jnp.int32)
-            hash_idx = corner_idx[...,None,:] + tmp_idx
-            residual = hash_idx - (x[...,None,:]+1) /2 *n
-            y = h[hash_idx[...,0],hash_idx[...,1],hash_idx[...,2]]
-            y_weights = jnp.prod(jnp.abs(residual), axis=-1, keepdims=True)
-            y = jnp.sum(y_weights * y, axis=-2)
-            y_list.append(y)
-        x = jnp.concatenate(y_list, axis=-1)
+        # # hashing table
+        # F = 2
+        # N_list = [4,9,13,17]
+        # y_list = []
+        # for n in N_list:
+        #     h = self.param('h'+str(n), nn.initializers.lecun_normal(), 
+        #                             (n+1, n+1, n+1, F), jnp.float32)
+        #     corner_idx = jnp.floor((x+1)*n/2).astype(jnp.int32)
+        #     tmp_idx = jnp.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1],
+        #                             [1,1,0],[1,0,1],[0,1,1],[1,1,1]], jnp.int32)
+        #     hash_idx = corner_idx[...,None,:] + tmp_idx
+        #     residual = hash_idx - (x[...,None,:]+1) /2 *n
+        #     y = h[hash_idx[...,0],hash_idx[...,1],hash_idx[...,2]]
+        #     y_weights = jnp.prod(jnp.abs(residual), axis=-1, keepdims=True)
+        #     y = jnp.sum(y_weights * y, axis=-2)
+        #     y_list.append(y)
+        # x = jnp.concatenate(y_list, axis=-1)
 
         z = jnp.expand_dims(z, axis=-2)
         z_tile = jnp.tile(z, (1, x.shape[1], 1))
         x = jnp.concatenate([x, z_tile], axis=-1)
         for _ in range(3):
-            x = nn.Dense(256)(x)
+            x = nn.Dense(128)(x)
             x = nn.relu(x)
         x = nn.Dense(1)(x)
         x = nn.tanh(x) * self.clip_value
@@ -280,7 +282,15 @@ def visualize_sdf(params, jkey, data):
     plt.show()
 
 # visualize_sdf(params, jkey, data)
+# %%
+# util functions
+def get_all_z():
+    z_res = {}
+    for pic in pic_dict:
+        z_res[pic] = enc.apply(params[0], pic_dict[pic][None])
+    return z_res
 
+all_z = get_all_z()
 # %% 
 # start train
 optimizer = optax.adam(5e-4)
@@ -303,5 +313,42 @@ for ep in range(EPOCH):
     if ep%500 == 0 :
         visualize_sdf(params, jkey, data)
         print("ep {} // loss {}".format(ep,loss))
+        with open('sdfvae.pickle', 'wb') as handle:
+            pickle.dump(params, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        with open('all_z.pickle', 'wb') as handle:
+            pickle.dump(get_all_z(), handle, protocol=pickle.HIGHEST_PROTOCOL)
 
+
+# %%
+# define jit func
+with open('save_model/sdfvae.pickle', 'rb') as handle:
+    params = pickle.load(handle)
+with open('save_model/all_z.pickle', 'rb') as handle:
+    all_z = pickle.load(handle)
+
+# %%
+def visualize_sdf(params, all_z):
+    # reconstruction
+    z_means = jnp.array(list(all_z.values()))[:,0,0]    
+
+    def sdf_func(x, z_hat_, idx):
+        origin_shape = x.shape
+        x_expanded = jnp.reshape(x, (-1, 3))
+        x_expanded = x_expanded[None,...]
+        occ = dec.apply(params[1], x_expanded, z_hat_[idx:idx+1])
+        return jnp.reshape(occ, origin_shape[:-1])
+
+    view_SO3 = jl.SO3.from_x_radians(jnp.pi+jnp.pi/8)@jl.SO3.from_y_radians(jnp.pi/8)
+    cam_SE3 = jl.SE3.from_rotation(rotation=view_SO3) @ \
+        jl.SE3.from_rotation_and_translation(rotation=jl.SO3(jnp.array([1,0,0,0],dtype=jnp.float32)), translation=jnp.array([0,0,-2.0]))
+    light_position = jnp.array([-1.5,1.0,2.0])
+
+    plt.figure(figsize=[20,20])
+    for i in range(20):
+        plt.subplot(4,5,i+1)
+        plt.imshow(sdfu.sdf_renderer_exact(lambda x :sdf_func(x, z_means, i), cam_SE3=cam_SE3, far=3, light_position=light_position))
+        plt.axis('off')
+    plt.show()
+
+visualize_sdf(params, all_z)
 # %%

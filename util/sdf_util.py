@@ -210,13 +210,7 @@ def cylinder_round_sdf(r, half_h, re):
     return lambda x : cylinder_sdf(r-re, half_h-re)(x) - re
 
 def capsule_sdf(r,h):
-    hz = jnp.zeros_like(h)
-    hz = jnp.stack([hz, hz, 0.5*h], axis=-1)
-    return union_sdf( 
-            union_sdf(transform_sdf(sphere_sdf(r), hz), 
-                    transform_sdf(sphere_sdf(r), -hz))
-                    ,cylinder_sdf(r*0.99,h)
-                    )
+    return lambda x : cylinder_sdf(jnp.zeros_like(h), 0.5*h)(x) - r
 
 def primitive_sdf(geo_param):
     type, param = geo_param[...,0:1].astype(jnp.int32), geo_param[...,1:]
@@ -253,10 +247,14 @@ if __name__ == '__main__':
 
     # sdf_func = sphere_sdf(0.8)
     # sdf_func = union_sdf(sphere_sdf(0.6), box_sdf(np.array([0.8,0.1,0.1])))
-    sdf_func = capsule_sdf(0.8, 0.4)
+    # sdf_func = capsule_sdf(0.3, 0.5)
     # sdf_func = transform_sdf(sdf_func, scale=2)
     # sdf_func = box_sdf(np.array([0.4,0.5,0.6]))
     # sdf_func = cylinder_sdf(0.4, 0.2)
+    # sdf_func = cylinder_round_sdf(0.6, 0.4, 0.1)
+    # sdf_func = box_round_sdf(np.array([0.3,0.3,0.7]), 0.3) # cylinder
+    # sdf_func = box_round_sdf(np.array([0.5,0.5,0.5]), 0.5) # sphere
+    sdf_func = box_round_sdf(np.array([0.5,0.5,0.5]), 0.01) # box
 
     view_SO3 = jl.SO3.from_x_radians(jnp.pi+jnp.pi/8)@jl.SO3.from_y_radians(jnp.pi/8)
     cam_SE3 = jl.SE3.from_rotation(rotation=view_SO3) @ \
