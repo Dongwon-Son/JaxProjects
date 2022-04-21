@@ -8,6 +8,7 @@ import einops
 from moviepy.editor import ImageSequenceClip
 from IPython.display import Image
 import time
+import matplotlib.pyplot as plt
 
 import util.sdf_util as sdfutil
 import util.transform_util as tutil
@@ -101,39 +102,96 @@ def cull_idx(pos, k, fix_idx=None):
     sort_idx = jnp.argsort(distanceij)[...,:k]
     return oi_idx[sort_idx], oj_idx[sort_idx]
 
-def calculate_contact_points(jkey, cp_no, geo_paramij, posij, quatij, scaleij, culli):
+def calculate_contact_points(jkey, cp_no, geo_paramij, posij, quatij, scaleij, culli, visualize=False):
     # get contact points
     ns = cp_no
-    x_samples_ij = jax.random.uniform(jkey, posij.shape[:-2] + (ns,3), posij.dtype, -1, 1)
-    x_samples_i = tutil.pq_action(posij[...,0:1,:], quatij[...,0:1,:], x_samples_ij[...,:int(ns/2),:]/scaleij[...,0:1,:]/geo_paramij[...,0:1,1:])
-    x_samples_j = tutil.pq_action(posij[...,1:2,:], quatij[...,1:2,:], x_samples_ij[...,int(ns/2):,:]/scaleij[...,1:2,:]/geo_paramij[...,1:2,1:])
-    x_samples_i = jnp.where(einops.repeat(culli, '... i -> ... i ns 1', ns=int(ns/2))==0, x_samples_j.at[...,2].set(-x_samples_j[...,2]), x_samples_i) ## if plane.. opposite samples
+    assert ns >= 18
+    # x_samples_ij = jax.random.uniform(jkey, posij.shape[:-2] + (ns,3), posij.dtype, -1, 1)
+    # x_samples_ij = jax.random.normal(jkey, posij.shape[:-2] + (int(ns/2),3,2), posij.dtype)*jnp.array([0.1,1])
+    # x_samples_ij = jnp.stack([jax.random.uniform(jkey, posij.shape[:-2] + (int(ns/2),3), posij.dtype, -2, 2), jax.random.normal(jkey, posij.shape[:-2] + (int(ns/2),3), posij.dtype)*0.1], axis=-1)
+    # x_samples_ij = einops.rearrange(x_samples_ij, '... i j k -> ... (i k) j')
+    # x_samples_i = tutil.pq_action(posij[...,0:1,:], quatij[...,0:1,:], x_samples_ij[...,:int(ns/2),:]*scaleij[...,0:1,:]*geo_paramij[...,0:1,1:])
+    # x_samples_j = tutil.pq_action(posij[...,1:2,:], quatij[...,1:2,:], x_samples_ij[...,int(ns/2):,:]*scaleij[...,1:2,:]*geo_paramij[...,1:2,1:])
+
+    corner = jnp.array([[1,1,1],[1,-1,-1],[-1,1,-1],[-1,-1,1],[1,1,-1],[1,-1,1],[-1,1,1],[-1,-1,-1]]).astype(jnp.float32)
+    corner = einops.repeat(corner, 'i j -> nb nr i j', nb=posij.shape[0], nr=posij.shape[1])
+    corner = jnp.concatenate([corner, jax.random.normal(jkey, posij.shape[:-2] + (int((ns-16)*0.5),3), posij.dtype)*0.1], axis=-2)
+    x_samples_i = tutil.pq_action(posij[...,0:1,:], quatij[...,0:1,:], corner*scaleij[...,0:1,:]*geo_paramij[...,0:1,1:])
+    x_samples_j = tutil.pq_action(posij[...,1:2,:], quatij[...,1:2,:], corner*scaleij[...,1:2,:]*geo_paramij[...,1:2,1:])
+    # x_samples_i = jnp.where(einops.repeat(culli, '... i -> ... i ns 1', ns=int(ns/2))==0, x_samples_j.at[...,2].set(-x_samples_j[...,2])+jax.random.normal(jkey,x_samples_j.shape)*0.010, x_samples_i) ## if plane.. opposite samples
+    x_samples_i = jnp.where(einops.repeat(culli, '... i -> ... i ns 1', ns=int(ns/2))==0, (posij[...,1:2,:]+jax.random.normal(jkey,x_samples_j.shape)*0.20*scaleij[...,1:2,:]) * jnp.array([1,1,-1]).astype(jnp.float32), x_samples_i) ## if plane.. opposite samples
     x_samples = jnp.concatenate([x_samples_i, x_samples_j], axis=-2)
     addparams = jax.tree_map(lambda x : einops.repeat(x, '... i j -> ... ns i j', ns=ns) , (geo_paramij, posij, quatij, scaleij))
 
     # broad phase
-    for _ in range(2):
-        _, jkey = jax.random.split(jkey)
-        sdf, grad = box_intsc_sdf_grad(x_samples, *addparams[1:])
-        x_samples -= grad*jnp.maximum(sdf[...,None], 0.001)
+    # for _ in range(2):
+    #     _, jkey = jax.random.split(jkey)
+    #     sdf, grad = box_intsc_sdf_grad(x_samples, *addparams[1:])
+    #     x_samples -= grad*jnp.maximum(sdf[...,None], 0.001)
+
+    if visualize:
+        ns_vis = 10000
+        pnts = jax.random.uniform(jkey, [1,1,ns_vis,3], jnp.float32, -0.10, 0.10)
+        addparams_vis = jax.tree_map(lambda x : einops.repeat(x, '... i j -> ... ns i j', ns=ns_vis) , (geo_paramij, posij, quatij, scaleij))
+        pnts = pnts.at[...,1].set(0)
+        test_sdfs = intsc_sdf(pnts, *addparams_vis)
+        pnts_plot = pnts.reshape(-1,3)
+        test_sdfs_plot = test_sdfs.reshape(-1)
+        plt.figure()
+        plt.scatter(pnts_plot[...,0], pnts_plot[...,2], s=10.0, c=test_sdfs_plot)
+        plt.scatter(pnts_plot[np.where(test_sdfs_plot<=0),0], pnts_plot[np.where(test_sdfs_plot<=0),2], s=10.0, c='red')
+        plt.show()
+
+        pnts_xy = jax.random.uniform(jkey, [1,1,ns_vis,3], jnp.float32, -0.010, 0.010)
+        pnts_xy = pnts_xy.at[...,2].set(-0.001)
+        test_sdfs_xy = intsc_sdf(pnts_xy, *addparams_vis)
+        pnts_xy_plot = pnts_xy.reshape(-1,3)
+        test_sdfs_xy_plot = test_sdfs_xy.reshape(-1)
+        plt.figure()
+        plt.scatter(pnts_xy_plot[...,0], pnts_xy_plot[...,1], s=10.0, c=test_sdfs_xy_plot)
+        plt.scatter(pnts_xy_plot[np.where(test_sdfs_xy_plot<=0),0], pnts_xy_plot[np.where(test_sdfs_xy_plot<=0),1], s=10.0, c='red')
+        plt.show()
 
     # narrow phase
-    for _ in range(3):
+    for _ in range(1):
+        if visualize:
+            sample_plot = x_samples.reshape(-1,3)
+            # sdf_plot = sdf.reshape(-1)
+            plt.figure()
+            plt.subplot(1,2,1)
+            plt.scatter(pnts_plot[np.where(test_sdfs_plot>0),0], pnts_plot[np.where(test_sdfs_plot>0),2], s=10.0, c=test_sdfs_plot[np.where(test_sdfs_plot>0)])
+            plt.scatter(sample_plot[...,0], sample_plot[...,2], s=10.0, c='red')
+            plt.subplot(1,2,2)
+            plt.scatter(pnts_xy_plot[np.where(test_sdfs_xy_plot>0),0], pnts_xy_plot[np.where(test_sdfs_xy_plot>0),1], s=10.0, c=test_sdfs_xy_plot[np.where(test_sdfs_xy_plot>0)])
+            plt.scatter(sample_plot[...,0], sample_plot[...,1], s=10.0, c='red')
+            plt.show()
         _, jkey = jax.random.split(jkey)
         sdf, grad = intsc_sdf_grad(x_samples, *addparams) # (NB, NR, NS)
-        x_samples -= grad*jnp.maximum(sdf[...,None], 0.001)
+        x_samples -= sdfutil.normalize(grad)*jnp.maximum(sdf[...,None], 0.001)
+
+    if visualize:
+        sample_plot = x_samples.reshape(-1,3)
+        # sdf_plot = sdf.reshape(-1)
+        plt.figure()
+        plt.subplot(1,2,1)
+        plt.scatter(pnts_plot[np.where(test_sdfs_plot>0),0], pnts_plot[np.where(test_sdfs_plot>0),2], s=10.0, c=test_sdfs_plot[np.where(test_sdfs_plot>0)])
+        plt.scatter(sample_plot[...,0], sample_plot[...,2], s=10.0, c='red')
+        plt.subplot(1,2,2)
+        plt.scatter(pnts_xy_plot[np.where(test_sdfs_xy_plot>0),0], pnts_xy_plot[np.where(test_sdfs_xy_plot>0),1], s=10.0, c=test_sdfs_xy_plot[np.where(test_sdfs_xy_plot>0)])
+        plt.scatter(sample_plot[...,0], sample_plot[...,1], s=10.0, c='red')
+        plt.show()
+
     csdf_sij, grad_sij = sdf_grad(einops.repeat(x_samples, '... i -> ... 2 i'), *addparams)
     cps_si = x_samples
     normal_sij_tmp = sdfutil.normalize(grad_sij)
     normal_si = normal_sij_tmp[...,0,:] - normal_sij_tmp[...,1,:]
-    normal_si = sdfutil.normalize(normal_si)
+    cns_si = sdfutil.normalize(normal_si)
 
     # plane_normal normal
-    norma_si_plane = jnp.zeros_like(normal_si).at[...,2].set(1)
-    cns_si = jnp.where(einops.repeat(culli, '... i -> ... i ns 1', ns=ns)==0, norma_si_plane, normal_si)
+    # norma_si_plane = jnp.zeros_like(normal_si).at[...,2].set(1)
+    # cns_si = jnp.where(einops.repeat(culli, '... i -> ... i ns 1', ns=ns)==0, norma_si_plane, normal_si)
     
     return jnp.stack([cps_si, cps_si], axis=-2), jnp.stack([cns_si, -cns_si], axis=-2), csdf_sij
-
 
 def dynamics_step(jkey, geo_param, pos, quat, scale, twist, ext_wrench, 
                     cull_k, fix_idx, dt, mass, inertia, cp_no, baumgarte_erp, elasticity, mu, substep):
@@ -162,12 +220,14 @@ def dynamics_step(jkey, geo_param, pos, quat, scale, twist, ext_wrench,
         cvel_d_si_dir = cvel_d_si_vec / (1e-6 + cvel_d_value[...,None])
 
         # contact resolution
-        baumgarte_vel_value_sij = baumgarte_erp * cpd_sij
+        # baumgarte_vel_value_sij = baumgarte_erp * cpd_sij
+        baumgarte_vel_value_s = jnp.sum(baumgarte_erp * cpd_sij, axis=-1)
+        # baumgarte_vel_value_s = jnp.max(baumgarte_erp * cpd_sij, axis=-1)
         tmp_sij = inertia * jnp.cross(relpos_sij, cns_sij[...,0:1,:])
         tmp_sij = jnp.where(einops.repeat(cull_ij, '... i j -> ... i ns j 1', ns=tmp_sij.shape[-3])==0, 0, tmp_sij)
         ang_s = jnp.sum(cns_sij[...,0,:] * jnp.sum(jnp.cross(tmp_sij, relpos_sij), axis=-2), axis=-1)
 
-        imp_n_s_value = ((1. + elasticity) * cvel_n_value + jnp.sum(baumgarte_vel_value_sij, axis=-1)) / (
+        imp_n_s_value = ((1. + elasticity) * cvel_n_value + baumgarte_vel_value_s) / (
                         1. / mass + 1. / mass + ang_s)
 
         # friction contact
@@ -210,18 +270,31 @@ def dynamics_step(jkey, geo_param, pos, quat, scale, twist, ext_wrench,
 
 dynamics_step_jit = jax.jit(dynamics_step, static_argnames=['cp_no', 'cull_k', 'mass', 'inertia', 'substep'])
 
+# %% cd test
+# _, jkey = jax.random.split(jkey)
+# inputs_cd = (jnp.array([[0,1,1,1]], dtype=jnp.float32), jnp.array([[0.,0.,0.07]], dtype=jnp.float32), jnp.array([[0,0,0,1]], dtype=jnp.float32), jnp.array([[0.080]], dtype=jnp.float32))
+# inputs_cd = jax.tree_map(lambda x : einops.repeat(x, 'i j -> tile i j', tile=1), inputs_cd)
+
+# # add table - should be index 0!!!
+# plane_param = (jnp.array([[0,1,1,0.05]]), jnp.array([[0,0,-0.05]]), jnp.array([[0,0,0,1]]), jnp.array([[1]]))
+# plane_param = jax.tree_map(lambda x : einops.repeat(x, 'i j -> tile i j', tile=1), plane_param)
+# inputs_cd = jax.tree_map(lambda *x : jnp.concatenate(x, axis=1)[...,None,:,:], plane_param, inputs_cd)
+
+# culli = jnp.zeros_like(inputs_cd[-1][...,0,0])
+# cps, cns, sdfs = calculate_contact_points(jkey, 20, *inputs_cd, culli, visualize=True)
+
 # %%
 # physical test init
 prutil.init()
 
 # %%
 # param random
-NB = 1
-NO = 20
+NB = 100
+NO = 30
 inputs = random_param(jkey, (NB,NO))
 
 # test primitives
-# inputs = (jnp.array([[0,1,1,1]], dtype=jnp.float32), jnp.array([[0.1,0.1,0.10]], dtype=jnp.float32), jnp.array([[np.sin(np.pi/12),0,0,np.cos(np.pi/12)]], dtype=jnp.float32), jnp.array([[0.080]], dtype=jnp.float32))
+# inputs = (jnp.array([[3,1,1,1]], dtype=jnp.float32), jnp.array([[0.1,0.1,0.10]], dtype=jnp.float32), jnp.array([[np.sin(np.pi/12),0,0,np.cos(np.pi/12)]], dtype=jnp.float32), jnp.array([[0.080]], dtype=jnp.float32))
 # inputs = jax.tree_map(lambda x : einops.repeat(x, 'i j -> tile i j', tile=NB), inputs)
 
 # add table - should be index 0!!!
@@ -229,7 +302,7 @@ plane_param = (jnp.array([[0,1,1,0.05]]), jnp.array([[0,0,-0.05]]), jnp.array([[
 plane_param = jax.tree_map(lambda x : einops.repeat(x, 'i j -> tile i j', tile=NB), plane_param)
 inputs = jax.tree_map(lambda *x : jnp.concatenate(x, axis=1), plane_param, inputs)
 geo_param, pos, quat, scale = inputs
-prutil.make_objs(geo_param[-1], pos[-1], quat[-1], scale[-1])
+prutil.make_objs_primitives(geo_param[-1], pos[-1], quat[-1], scale[-1])
 
 # %%
 # dynamics step
@@ -237,13 +310,13 @@ geo_param, pos, quat, scale = inputs
 physics_param = {}
 physics_param['mass'] = 1.0
 physics_param['inertia'] = 0.02
-physics_param['dt'] = 0.001
+physics_param['dt'] = 0.002
 physics_param['substep'] = 5
 physics_param['cull_k'] = 80
 physics_param['baumgarte_erp'] = 40.0
 physics_param['elasticity'] = 0
-physics_param['mu'] = 0.3
-physics_param['cp_no'] = 6
+physics_param['mu'] = 0.8
+physics_param['cp_no'] = 20
 physics_param['fix_idx'] = jnp.array([0]).astype(jnp.int32)
 twist = jnp.zeros(pos.shape[:-1] + (6,), dtype=jnp.float32)
 frames = []
@@ -255,8 +328,8 @@ for i in range(400):
     gv_force = -9.81 * jnp.ones_like(pos) * physics_param['mass']
     gv_force = gv_force.at[:,:,:2].set(0)
     ext_wrench = jnp.concatenate([gv_force, jnp.zeros_like(gv_force)], axis=-1)
-    # pos, quat, twist = dynamics_step_jit(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
-    pos, quat, twist = dynamics_step(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
+    pos, quat, twist = dynamics_step_jit(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
+    # pos, quat, twist = dynamics_step(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
 
     # pybullet capture
     if i%pp == 0:

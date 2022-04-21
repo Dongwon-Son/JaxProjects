@@ -18,7 +18,7 @@ def get_rgb(cam_pos = [0,0.45,0.45]):
 
     return rgb
 
-def make_objs(gparam, pos, quat, scale):
+def make_objs_primitives(gparam, pos, quat, scale):
     type, param = gparam[...,0].astype(np.int32), gparam[...,1:]
     p.resetSimulation()
     obj_id_list = []
@@ -51,5 +51,20 @@ def make_objs(gparam, pos, quat, scale):
             ))
         else:
             raise ValueError
+        
+        p.resetBasePositionAndOrientation(obj_id_list[-1], ps, qt)
+
+
+
+def make_objs_mesh(mesh_dir_list, pos, quat, scale):
+    p.resetSimulation()
+    obj_id_list = []
+
+    for md, ps, qt, sc in zip(mesh_dir_list, pos, quat, scale):
+        obj_id_list.append(p.createMultiBody(baseMass=0,
+                # baseCollisionShapeIndex=p.createCollisionShape(p.GEOM_BOX, halfExtents=gp),
+                baseVisualShapeIndex=p.createVisualShape(p.GEOM_MESH, fileName=md, meshScale=sc),
+                                                    # rgbaColor=np.random.uniform(0,1,size=4)),
+                ))
         
         p.resetBasePositionAndOrientation(obj_id_list[-1], ps, qt)
