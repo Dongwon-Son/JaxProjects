@@ -77,7 +77,16 @@ def loss_sample(param, x):
     lp = logprob(param, x)
     return -jnp.mean(lp)
 
+def loss_kld(param, jkey, log_prob_gt_func):
+    x = sample(param, jkey, n=5000)
+    x = jax.lax.stop_gradient(x)
+    lp_pred = logprob(param, x)
+    lp_gt = log_prob_gt_func(x)
+    return -jnp.mean(jnp.exp(lp_gt-jax.lax.stop_gradient(lp_pred)) *lp_pred)
+
+
 loss_value_and_grad = jax.value_and_grad(loss_sample)
+loss_kld_value_and_grad = jax.value_and_grad(loss_kld)
 
 # %%
 # train
@@ -97,8 +106,15 @@ def train_step(param, opt_state, jkey, itr=1):
         updates, opt_state = optimizer.update(grad, opt_state)
         param = optax.apply_updates(param, updates)
     return param, opt_state, value
-
 train_step_jit = jax.jit(train_step, static_argnames=['itr'])
+
+def train_step_kld(param, opt_state, jkey, log_prob_gt_func, itr=1):
+    for i in range(itr):
+        value, grad = loss_kld_value_and_grad(param, jkey, log_prob_gt_func)
+        updates, opt_state = optimizer.update(grad, opt_state)
+        param = optax.apply_updates(param, updates)
+    return param, opt_state, value
+train_step_kld_jit = jax.jit(train_step_kld, static_argnames=['log_prob_gt_func', 'itr'])
 
 x_gt = dist.sample(2000, seed=jkey)
 def sample_plot(param, jkey):
@@ -108,15 +124,14 @@ def sample_plot(param, jkey):
     plt.scatter(x_sp[...,0],x_sp[...,1], c='r')
     plt.show()
     plt.close()
-    
 
 
 # %%
 # train step
 for i in range(100000):
     _, jkey = jax.random.split(jkey)
-    param, opt_state, loss = train_step_jit(param, opt_state, jkey, itr=10)
-    # param, opt_state, loss = train_step(param, opt_state, jkey, itr=1)
+    # param, opt_state, loss = train_step_jit(param, opt_state, jkey, itr=10)
+    param, opt_state, loss = train_step_kld_jit(param, opt_state, jkey, dist.log_prob, itr=10)
     if i % 1000 == 0:
         print(i, loss)
         sample_plot(param, jkey)
