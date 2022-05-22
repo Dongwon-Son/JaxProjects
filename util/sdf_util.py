@@ -209,17 +209,30 @@ def cylinder_sdf(r, half_h):
 def cylinder_round_sdf(r, half_h, re):
     return lambda x : cylinder_sdf(r-re, half_h-re)(x) - re
 
-def capsule_sdf(r,h):
-    return lambda x : cylinder_sdf(jnp.zeros_like(h), 0.5*h)(x) - r
+def capsule_sdf(r, half_h):
+    return lambda x : cylinder_sdf(jnp.zeros_like(half_h), half_h)(x) - r
+
+def capsule_param_to_cylinder_r(param):
+    param
 
 def primitive_sdf(geo_param):
     type, param = geo_param[...,0:1].astype(jnp.int32), geo_param[...,1:]
+
+    # box_cylinder parametrization
+    param = jnp.where(type == 1, jnp.stack([jnp.ones_like(param[...,0])*param[...,0],param[...,2],param[...,0]*jnp.ones_like(param[...,0])], axis=-1) , param)
+    param = jnp.where(type == 2, param.at[...,2].set(0.002), param)
+    param = jnp.where(type == 3, jnp.concatenate([param[...,0:1]*jnp.ones_like(param[...,0:2]), param[...,0:1]*jnp.ones_like(param[...,0:1])], axis=-1), param)
+
+    type = jnp.where(type > 0, 1, type)
+
     def sdf_func(x):
         sdf1 = box_round_sdf(param, 0.002)(x)
-        sdf2 = capsule_sdf(param[...,0], param[...,2])(x)
-        sdf3 = cylinder_round_sdf(param[...,0], param[...,2], 0.002)(x)
-        sdf4 = sphere_sdf(param[...,0])(x)
-        sdfs = jnp.stack([sdf1, sdf2, sdf3, sdf4], axis=-1)
+        sdf2 = cylinder_round_sdf(param[...,0], param[...,1], param[...,2])(x)
+        # sdf2 = capsule_sdf(param[...,0], param[...,2])(x)
+        # sdf3 = cylinder_round_sdf(param[...,0], param[...,2], 0.002)(x)
+        # sdf4 = sphere_sdf(param[...,0])(x)
+        # sdfs = jnp.stack([sdf1, sdf2, sdf3, sdf4], axis=-1)
+        sdfs = jnp.stack([sdf1, sdf2], axis=-1)
         return jnp.take_along_axis(sdfs, type, axis=-1)
     
     return sdf_func

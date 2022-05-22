@@ -19,7 +19,7 @@ jkey = jax.random.PRNGKey(1)
 # build params
 def random_param(jkey, outer_shape=(1,)):
     _, jkey = jax.random.split(jkey)
-    pos = jax.random.uniform(jkey, shape=outer_shape+(3,), minval=jnp.array([-0.3,-0.3,0]), maxval=jnp.array([0.3,0.3,0.6]), dtype=jnp.float32)
+    pos = jax.random.uniform(jkey, shape=outer_shape+(3,), minval=jnp.array([-0.3,-0.3,0.2]), maxval=jnp.array([0.3,0.3,0.6]), dtype=jnp.float32)
 
     _, jkey = jax.random.split(jkey)
     quat = tutil.qrand(outer_shape, jkey)
@@ -311,19 +311,19 @@ physics_param = {}
 physics_param['mass'] = 1.0
 physics_param['inertia'] = 0.02
 physics_param['dt'] = 0.002
-physics_param['substep'] = 5
+physics_param['substep'] = 10
 physics_param['cull_k'] = 80
 physics_param['baumgarte_erp'] = 40.0
 physics_param['elasticity'] = 0
 physics_param['mu'] = 0.8
-physics_param['cp_no'] = 20
+physics_param['cp_no'] = 18
 physics_param['fix_idx'] = jnp.array([0]).astype(jnp.int32)
 twist = jnp.zeros(pos.shape[:-1] + (6,), dtype=jnp.float32)
 frames = []
 fps = 20
 pp = int(1/physics_param['dt']/physics_param['substep']/fps)
 st = time.time()
-for i in range(400):
+for i in range(200):
     _, jkey = jax.random.split(jkey)
     gv_force = -9.81 * jnp.ones_like(pos) * physics_param['mass']
     gv_force = gv_force.at[:,:,:2].set(0)
@@ -347,20 +347,3 @@ Image('test.gif')
 
 # %%
 # %timeit dynamics_step_jit(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
-# %%
-# total iteration jit time
-def dynamics_itr(jkey, geo_param, pos, quat, scale, twist, ext_wrench, 
-                    cull_k, fix_idx, dt, mass, inertia, gain, cp_no, gain_b):
-    for i in range(1000):
-        _, jkey = jax.random.split(jkey)
-        gv_force = -9.81 * jnp.ones_like(pos) * mass
-        gv_force = gv_force.at[:,:,:2].set(0)
-        ext_wrench = jnp.concatenate([gv_force, jnp.zeros_like(gv_force)], axis=-1)
-        # pos, quat, twist = dynamics_step_jit(jkey, geo_param, pos, quat, scale, twist, ext_wrench, cull_k, fix_idx, dt, mass, inertia, gain, cp_no, gain_b)
-        pos, quat, twist = dynamics_step(jkey, geo_param, pos, quat, scale, twist, ext_wrench, cull_k, fix_idx, dt, mass, inertia, gain, cp_no, gain_b)
-    return pos, quat, twist
-
-dynamics_itr_jit = jax.jit(dynamics_itr, static_argnames=['cp_no', 'cull_k', 'mass', 'dt', 'inertia'])
-
-# %timeit dynamics_itr_jit(jkey, geo_param, pos, quat, scale, twist, ext_wrench, **physics_param)
-# %%

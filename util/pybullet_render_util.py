@@ -35,13 +35,13 @@ def make_objs_primitives(gparam, pos, quat, scale):
             obj_id_list.append(p.createMultiBody(
                 baseMass=1,
                 baseCollisionShapeIndex=p.createCollisionShape(p.GEOM_CAPSULE, radius=gp[0], height=gp[2]),
-            baseVisualShapeIndex=p.createVisualShape(p.GEOM_CAPSULE, radius=gp[0], length=gp[2],rgbaColor=np.random.uniform(0,1,size=4)),
+            baseVisualShapeIndex=p.createVisualShape(p.GEOM_CAPSULE, radius=gp[0], length=gp[2]*0.5, rgbaColor=np.random.uniform(0,1,size=4)),
             ))
         elif ty == 2:
             obj_id_list.append(p.createMultiBody(
                 baseMass=1,
                 baseCollisionShapeIndex=p.createCollisionShape(p.GEOM_CYLINDER, radius=gp[0], height=gp[2]),
-                baseVisualShapeIndex=p.createVisualShape(p.GEOM_CYLINDER, radius=gp[0], length=gp[2],rgbaColor=np.random.uniform(0,1,size=4)),
+                baseVisualShapeIndex=p.createVisualShape(p.GEOM_CYLINDER, radius=gp[0], length=gp[2]*0.5, rgbaColor=np.random.uniform(0,1,size=4)),
             ))
         elif ty == 3:
             obj_id_list.append(p.createMultiBody(
