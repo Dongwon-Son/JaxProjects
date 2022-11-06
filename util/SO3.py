@@ -183,6 +183,29 @@ def cg_product_list(J, lin_list, lout_list, f1, f2):
     return np.einsum('...ij,...j->...i', _basis_transformation_Q_J_list(J, lin_list, lout_list).T, np.kron(f1, f2))
 
 
+def nf_to_nl(nf):
+    if nf==9:
+        return 3
+    elif nf==4:
+        return 2
+    elif nf==1:
+        return 1
+    else:
+        raise ValueError
+
+def nl_to_npair(nl):
+    '''
+    sum of null space dim in _basis_transformation_Q_J_list
+    '''
+    if nl==1:
+        raise NotImplementedError
+    elif nl==2:
+        raise NotImplementedError
+    elif nl==3:
+        return 3+6+6
+    else:
+        raise NotImplementedError
+
 def cg_product_weights(weight, nlout, f1, f2, Q=None):
     '''
     Q: list[nf1*nf2 x nfo0, nf1*nf2 x nfo1, ...]
@@ -191,15 +214,6 @@ def cg_product_weights(weight, nlout, f1, f2, Q=None):
     weight: nc1*nc2*nlout*nl1*nl2
     return: nc1*nc2 x nfo
     '''
-    def nf_to_nl(nf):
-        if nf==9:
-            return 3
-        elif nf==4:
-            return 2
-        elif nf==1:
-            return 1
-        else:
-            raise ValueError
     nf1 = f1.shape[-1]
     nf2 = f2.shape[-1]
     nc1 = f1.shape[-2]
@@ -233,7 +247,15 @@ def cg_product_weights(weight, nlout, f1, f2, Q=None):
     else:
         raise ValueError
 
-
+def sh_layer(fin, pnt, weight=None):
+    nl = nf_to_nl(fin.shape[-1])
+    nc = fin.shape[-2]
+    npair = nl_to_npair(nl)
+    assert weight.shape[-1] == nc*npair
+    sh = np.concatenate([sh_via_wigner_d(i, pnt) for i in range(nl)], axis=-1)
+    sh = sh[None]
+    res = cg_product_weights(weight, nl, sh, fin, Q=None)
+    return res
 
 
 ## test code ###
@@ -319,18 +341,7 @@ def _test_Q_J_list():
     order_out_list = [0,1,2]
     Q = _basis_transformation_Q_J_list(2, order_in_list, order_out_list, test=True)
 
-
-
-
-if __name__ == '__main__':
-    # res = _basis_transformation_Q_J(2,1,1,test=True)
-    # _basis_transformation_Q_J_list(1, [0,1,2], [0,1,2], test=True)
-    # for i in range(3):
-    #     # _basis_transformation_Q_J(i,2,2,test=True)
-    #     _basis_transformation_Q_J_list(i, [0,1,2], [0,1,2], test=True)
-
-    nl1 = 3
-    nl2 = 3
+def cg_product_weight_test():
     nlout = 3
     nc1 = 2
     nc2 = 3
@@ -351,6 +362,43 @@ if __name__ == '__main__':
 
     foutD = cg_product_weights(weight, nlout, matmul(D012,f1), matmul(D012,f2))
     Dfout = [matmul(d,f) for f, d in zip(cg_product_weights(weight, nlout, f1, f2), [D0,D1,D2])]
+
+    print(np.sum([np.sum(np.abs(a-b)) for a, b in zip(foutD, Dfout)]))
+
+
+def sh_layer_test():
+    nc1 = 2
+    f1 = np.random.normal(size=(nc1,9,))
+    npair = (3+6+6)
+    quat = np.random.normal(size=(4,))
+    quat = quat / np.linalg.norm(quat)
+
+    pnt = np.random.normal(size=(3,))
+
+    D012 = wigner_d_from_quat([0,1,2], quat)
+    D0 = wigner_d_from_quat(0, quat)
+    D1 = wigner_d_from_quat(1, quat)
+    D2 = wigner_d_from_quat(2, quat)
+    def matmul(a,b):
+        return np.einsum('...ij,...j',a,b)
+    
+    weight = np.random.normal(size=(nc1*npair,))
+    foutD = sh_layer(matmul(D012,f1), sciR.from_quat(quat).apply(pnt),weight=weight)
+    Dfout = [matmul(d,f) for f, d in zip(sh_layer(f1, pnt,weight=weight), [D0,D1,D2])]
+
+    print(np.sum([np.sum(np.abs(a-b)) for a, b in zip(foutD, Dfout)]))
+
+
+if __name__ == '__main__':
+
+    # res = _basis_transformation_Q_J(2,1,1,test=True)
+    # _basis_transformation_Q_J_list(1, [0,1,2], [0,1,2], test=True)
+    # for i in range(3):
+    #     # _basis_transformation_Q_J(i,2,2,test=True)
+    #     _basis_transformation_Q_J_list(i, [0,1,2], [0,1,2], test=True)
+
+    sh_layer_test()
+    cg_product_weight_test()
 
     for i in range(6):
         _test_cg_product_list()
