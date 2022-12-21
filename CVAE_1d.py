@@ -89,14 +89,18 @@ log_dir = 'logs_cvae/' + current_time + "_" + str(args.seed) + "_" + str(args.fi
 summary_writer = tf.summary.create_file_writer(log_dir)
 shutil.copy(os.path.abspath(__file__), os.path.join(log_dir, os.path.basename(os.path.abspath(__file__))))
 
-for itr in range(90_000):
+for itr in range(40_000):
     params, opt_state, train_metric, jkey = train_step_jit(params, opt_state, jkey)
 
-    if itr != 0 and itr % 2500 == 0:
+    if itr != 0 and itr % 1000 == 0:
         # evals
         x = gen_data(jkey)
         _, jkey = jax.random.split(jkey)
-        z_mu, z_scale = enc.apply(params[0], x)
+        if args.fixx:
+            enc_inputs = jnp.zeros_like(x)
+        else:
+            enc_inputs = x
+        z_mu, z_scale = enc.apply(params[0], enc_inputs)
         z = jax.random.normal(jkey, shape=z_mu.shape, dtype=jnp.float32) * z_scale + z_mu
         x_rec = dec.apply(params[1], z)
 
