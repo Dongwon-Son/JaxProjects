@@ -77,9 +77,6 @@ fwd_samples = forward_process(jax.random.split(jkey)[1], gen_dataset(jkey, 1000)
 # plt.scatter(fwd_samples[:,0], fwd_samples[:,1])
 # plt.show()
 
-
-
-
 # %%
 # design network
 class Denoiser(nn.Module):
@@ -131,7 +128,7 @@ params = model.init(jkey, x, y, sigma_train_sample)
 model_apply_jit = jax.jit(model.apply)
 # %%
 # sampler
-def sampler(params, jkey, y, max_time_steps=max_time_steps):
+def euler_sampler(params, jkey, y, max_time_steps=max_time_steps):
     x = jax.random.normal(jkey, shape=y.shape)*get_time_steps(0, max_time_steps)
     _, jkey = jax.random.split(jkey)
     for i in range(max_time_steps+1):
@@ -144,6 +141,24 @@ def sampler(params, jkey, y, max_time_steps=max_time_steps):
         x = x0_pred + jax.random.normal(jkey, x0_pred.shape)*sigma_next
         _, jkey = jax.random.split(jkey)
     return x
+
+def heun_sampler(params, jkey, y, max_time_steps=max_time_steps):
+    x = jax.random.normal(jkey, shape=y.shape)*get_time_steps(0, max_time_steps)
+    _, jkey = jax.random.split(jkey)
+    for i in range(max_time_steps+1):
+        sigma = get_time_steps(i, max_time_steps)
+        sigma_next = get_time_steps(i+1, max_time_steps)
+        x0_pred = model_apply_jit(params, x, y, sigma)
+        d = (1/sigma)*x - 1/sigma*x0_pred
+        x_next = x + (sigma_next-sigma)*d
+        if i+1==max_time_steps:
+            x = x_next
+            break
+        x0_pred_next = model_apply_jit(params, x_next, y, sigma_next)
+        dprime = (1/sigma_next)*x_next - 1/sigma_next*x0_pred_next
+        x = x + (sigma_next-sigma)*(dprime+d)*0.5
+    return x
+
 # %%
 # define loss
 def cal_loss(params, x, y, jkey):
@@ -151,7 +166,9 @@ def cal_loss(params, x, y, jkey):
     _, jkey = jax.random.split(jkey)
     x_ptb = x + jax.random.normal(jkey, sigma_train_sample.shape) * sigma_train_sample
     x0_pred = model.apply(params, x_ptb, y, sigma_train_sample)
-    return jnp.mean((x - x0_pred)**2)
+
+    loss_weight = (sigma_train_sample**2 + sigma_data**2)/(sigma_train_sample*sigma_data)**2
+    return jnp.mean(loss_weight*(x - x0_pred)**2)
 
 cal_loss_grad = jax.grad(cal_loss)
 
@@ -177,11 +194,11 @@ train_func_jit = jax.jit(train_func)
 def eval_func(params, jkey):
     y = jax.random.uniform(jkey,shape=(2000,1),minval=-2,maxval=2)
     _, jkey = jax.random.split(jkey)
-    x_pred_10 = sampler(params, jkey, y, 10)
+    x_pred_10 = heun_sampler(params, jkey, y, 10)
     _, jkey = jax.random.split(jkey)
-    x_pred_100 = sampler(params, jkey, y, 100)
+    x_pred_100 = heun_sampler(params, jkey, y, 100)
     _, jkey = jax.random.split(jkey)
-    x_pred_500 = sampler(params, jkey, y, 1000)
+    x_pred_500 = euler_sampler(params, jkey, y, 100)
     _, jkey = jax.random.split(jkey)
     xy_gt = gen_dataset(jkey, 1000)
     _, jkey = jax.random.split(jkey)
